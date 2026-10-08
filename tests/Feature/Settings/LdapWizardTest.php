@@ -546,6 +546,27 @@ class LdapWizardTest extends TestCase
             ->assertHasErrors(['ldap_username_field']);
     }
 
+    public function test_step3_persists_company_and_website_mappings(): void
+    {
+        $this->actAsSuperuser();
+        $this->ensureSetting();
+
+        Livewire::test(LdapSettings::class)
+            ->set('highestStepReached', 3)
+            ->set('currentStep', 3)
+            ->set('ldap_username_field', 'samaccountname')
+            ->set('ldap_fname_field', 'givenname')
+            ->set('ldap_company', 'company')
+            ->set('ldap_website', 'wwwhomepage')
+            ->call('saveAndAdvance')
+            ->assertHasNoErrors()
+            ->assertSet('currentStep', 4);
+
+        $setting = Setting::getSettings()->fresh();
+        $this->assertSame('company', $setting->ldap_company);
+        $this->assertSame('wwwhomepage', $setting->ldap_website);
+    }
+
     // === Step 4 business logic =============================================
 
     public function test_step4_forces_ldap_enabled_true_on_save(): void

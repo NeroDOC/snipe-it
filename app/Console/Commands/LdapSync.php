@@ -406,6 +406,7 @@ class LdapSync extends Command
             $errors = '';
 
             if ($user->save()) {
+                Ldap::applyLdapCompanyToUser($user, $item);
                 $item['id'] = $user->id;
                 $item['note'] = $item['createorupdate'];
                 $item['status'] = 'success';
