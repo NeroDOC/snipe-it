@@ -194,7 +194,7 @@
                  .modal-danger red-header confirm rather than a browser
                  native prompt so it matches the rest of the app's
                  destructive-action UX. --}}
-            @if ($snipeSettings->ldap_enabled == '1')
+            @if ($ldap_enabled)
                 <div class="box-tools pull-right">
                     <button
                         type="button"
@@ -361,6 +361,39 @@
                 @endif
 
                 @if ($currentStep === 1)
+                    <!-- Connection name -->
+                    <x-form.row
+                        name="name"
+                        :label="trans('general.name')"
+                        :help_text="trans('admin/settings/general.ldap_connections.name_help')"
+                    >
+                        <x-slot:input>
+                            <x-input.text
+                                name="name"
+                                wire:model="name"
+                                placeholder="{{ trans('general.example').'Head office AD' }}"
+                                :required="true"
+                                :readonly="$isReadOnly"
+                            />
+                        </x-slot:input>
+                    </x-form.row>
+
+                    <!-- Login priority -->
+                    <x-form.row
+                        name="priority"
+                        :label="trans('admin/settings/general.ldap_connections.priority')"
+                        :help_text="trans('admin/settings/general.ldap_connections.priority_help')"
+                    >
+                        <x-slot:input>
+                            <x-input.text
+                                type="number"
+                                name="priority"
+                                wire:model="priority"
+                                :readonly="$isReadOnly"
+                            />
+                        </x-slot:input>
+                    </x-form.row>
+
                     <!-- AD flag -->
                     <x-form.checkbox-row
                         name="is_ad"
@@ -631,6 +664,75 @@
                         :disabled="$isReadOnly"
                     />
 
+                    <x-form.checkbox-row
+                        name="link_by_employee_number"
+                        wire:model.live="link_by_employee_number"
+                        :label="trans('admin/settings/general.ldap_connections.link_by_employee_number')"
+                        :checked="$link_by_employee_number"
+                        help_text="{{ trans('admin/settings/general.ldap_connections.link_by_employee_number_help') }}"
+                        :disabled="$isReadOnly"
+                    />
+
+                    {{-- Where synced users get their company from. Binding
+                         the connection to a company is optional. --}}
+                    <x-form.row
+                        name="company_source"
+                        :label="trans('admin/settings/general.ldap_connections.company_source')"
+                        :help_text="trans('admin/settings/general.ldap_connections.company_source_help')"
+                    >
+                        <x-slot:input>
+                            <x-input.select
+                                name="company_source"
+                                wire:model.live="company_source"
+                                :selected="$company_source"
+                                :options="[
+                                    \App\Models\LdapConnection::COMPANY_SOURCE_NONE => trans('admin/settings/general.ldap_connections.company_source_none'),
+                                    \App\Models\LdapConnection::COMPANY_SOURCE_CONNECTION => trans('admin/settings/general.ldap_connections.company_source_connection'),
+                                    \App\Models\LdapConnection::COMPANY_SOURCE_ATTRIBUTE => trans('admin/settings/general.ldap_connections.company_source_attribute'),
+                                ]"
+                                :forLivewire="true"
+                                style="width: 100%"
+                                :disabled="$isReadOnly"
+                            />
+                        </x-slot:input>
+                    </x-form.row>
+
+                    @if ($company_source === \App\Models\LdapConnection::COMPANY_SOURCE_CONNECTION)
+                        <x-form.row
+                            name="company_id"
+                            :label="trans('general.company')"
+                        >
+                            <x-slot:input>
+                                <x-input.select
+                                    name="company_id"
+                                    wire:model="company_id"
+                                    :selected="$company_id"
+                                    :options="['' => trans('general.select_company')] + $this->companies"
+                                    :forLivewire="true"
+                                    style="width: 100%"
+                                    :disabled="$isReadOnly"
+                                />
+                            </x-slot:input>
+                        </x-form.row>
+                    @elseif ($company_source === \App\Models\LdapConnection::COMPANY_SOURCE_ATTRIBUTE)
+                        <x-form.row
+                            name="ldap_company"
+                            :label="trans('admin/settings/general.ldap_company')"
+                            help_html="{!! trans('admin/settings/general.ldap_company_help') !!}"
+                        >
+                            <x-slot:input>
+                                <x-input.text
+                                    name="ldap_company"
+                                    wire:model.blur="ldap_company"
+                                    :placeholder="trans('general.example').($is_ad ? 'company' : 'o')"
+                                    :required="true"
+                                    :ignore-autofill="true"
+                                    :readonly="$isReadOnly"
+                                />
+                            </x-slot:input>
+                        </x-form.row>
+                    @endif
+
                     {{-- Sample-lookup section, boxed in an x-well so it
                          reads as a "try it" tool distinct from the field
                          list above. Fires wire:click directly (not the
@@ -822,6 +924,8 @@
                                 1 => [
                                     'title' => trans('admin/settings/general.ldap_wizard.step_connection'),
                                     'fields' => [
+                                        'name' => trans('general.name'),
+                                        'priority' => trans('admin/settings/general.ldap_connections.priority'),
                                         'ldap_server' => trans('admin/settings/general.ldap_server'),
                                         'ldap_tls' => trans('admin/settings/general.ldap_tls'),
                                         'ldap_server_cert_ignore' => trans('admin/settings/general.ldap_server_cert_ignore'),
@@ -854,6 +958,9 @@
                                         'ldap_manager' => trans('admin/settings/general.ldap_manager'),
                                         'ldap_dept' => trans('admin/settings/general.ldap_dept'),
                                         'ldap_location' => trans('admin/settings/general.ldap_location'),
+                                        'link_by_employee_number' => trans('admin/settings/general.ldap_connections.link_by_employee_number'),
+                                        'company_source' => trans('admin/settings/general.ldap_connections.company_source'),
+                                        'company_id' => trans('general.company'),
                                         'ldap_company' => trans('admin/settings/general.ldap_company'),
                                         'ldap_website' => trans('admin/settings/general.ldap_website'),
                                         'ldap_active_flag' => trans('admin/settings/general.ldap_active_flag'),
@@ -922,7 +1029,11 @@
                                             if (! $isBool && ! $isSecret && ($value === null || $value === '')) {
                                                 continue;
                                             }
-                                            if ($field === 'ldap_default_group' && $value !== null && $value !== '') {
+                                            if ($field === 'company_source') {
+                                                $displayValue = trans('admin/settings/general.ldap_connections.company_source_'.$value);
+                                            } elseif ($field === 'company_id' && $value !== null && $value !== '') {
+                                                $displayValue = \App\Models\Company::withoutGlobalScopes()->find($value)?->name ?? trans('general.unknown');
+                                            } elseif ($field === 'ldap_default_group' && $value !== null && $value !== '') {
                                                 // Resolve the id to the group name for readability.
                                                 $group_name = \App\Models\Group::find($value)?->name;
                                                 $displayValue = $group_name ?? trans('general.unknown');
@@ -1063,10 +1174,6 @@
         </div>
 
     </div>
-    <x-form.help name="legacy_form" icon="help">
-        Having trouble with the new wizard? You can <a href="{{ route('settings.ldap.index') }}">find
-            the legacy form here</a>, but please do let us know what trouble you're having so we can fix it.
-    </x-form.help>
 
 
     {{-- Disable-LDAP confirm modal. Only useful when LDAP is currently
@@ -1075,7 +1182,7 @@
          state alone between wizard re-renders. The confirm button still
          fires wire:click because Livewire delegates click events at the
          document level. --}}
-    @if ($snipeSettings->ldap_enabled == '1')
+    @if ($ldap_enabled)
         <div
             wire:ignore
             class="modal modal-danger fade"

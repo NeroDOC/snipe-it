@@ -26,6 +26,65 @@ use Illuminate\Support\Facades\Log;
 
 class Ldap extends Model
 {
+    /**
+     * Connection the static methods below currently operate on. Set via
+     * withConnection(); null falls back to config()'s default.
+     */
+    protected static ?LdapConnection $activeConnection = null;
+
+    /**
+     * libldap's client cert / key options are process-global. Remember
+     * whether we set them so a later connection without a client cert can
+     * clear them instead of silently inheriting the previous one.
+     */
+    protected static bool $clientCertApplied = false;
+
+    /**
+     * The LDAP config every method in this class reads: the active
+     * connection, else the first enabled connection, else the legacy
+     * settings row (installs that haven't configured a connection).
+     * Callers only read Setting-shaped ldap_* / is_ad / ad_domain
+     * properties, which LdapConnection mirrors.
+     */
+    public static function config(): object
+    {
+        return self::$activeConnection
+            ?? LdapConnection::enabled()->first()
+            ?? Setting::getSettings();
+    }
+
+    /**
+     * The LdapConnection behind config(), or null when running on the
+     * legacy settings row.
+     */
+    public static function currentConnection(): ?LdapConnection
+    {
+        $config = self::config();
+
+        return $config instanceof LdapConnection ? $config : null;
+    }
+
+    /**
+     * Run $callback with $connection as the active LDAP config, restoring
+     * whatever was active before, even if the callback throws.
+     *
+     * @template TReturn
+     *
+     * @param  callable(): TReturn  $callback
+     * @return TReturn
+     */
+    public static function withConnection(LdapConnection $connection, callable $callback): mixed
+    {
+        $previous = self::$activeConnection;
+        self::$activeConnection = $connection;
+
+        try {
+            return $callback();
+        } finally {
+            self::$activeConnection = $previous;
+        }
+    }
+
     public static function ignoreCertificates(bool $ignore_cert = true)
     {
         if (defined('LDAP_OPT_X_TLS_REQUIRE_CERT') && defined('LDAP_OPT_X_TLS_NEVER')) {
@@ -64,10 +123,11 @@ class Ldap extends Model
      */
     public static function connectToLdap()
     {
-        $ldap_host = Setting::getSettings()->ldap_server;
-        $ldap_version = Setting::getSettings()->ldap_version ?: 3;
-        $ldap_server_cert_ignore = Setting::getSettings()->ldap_server_cert_ignore;
-        $ldap_use_tls = Setting::getSettings()->ldap_tls;
+        $config = self::config();
+        $ldap_host = $config->ldap_server;
+        $ldap_version = $config->ldap_version ?: 3;
+        $ldap_server_cert_ignore = $config->ldap_server_cert_ignore;
+        $ldap_use_tls = $config->ldap_tls;
 
         // If we are ignoring the SSL cert we need to setup the environment variable
         // before we create the connection
@@ -79,9 +139,20 @@ class Ldap extends Model
         }
         // You _were_ allowed to do this *after* the ldap_connect() in some versions of PHP, but it's not how they want
         // you to anymore, and it seems to not work at all in later PHP versions.
-        if (Setting::getSettings()->ldap_client_tls_cert && Setting::getSettings()->ldap_client_tls_key) {
-            ldap_set_option(null, LDAP_OPT_X_TLS_CERTFILE, Setting::get_client_side_cert_path());
-            ldap_set_option(null, LDAP_OPT_X_TLS_KEYFILE, Setting::get_client_side_key_path());
+        //
+        // These options are process-global, so with several connections in
+        // one process (ldap-sync looping over directories) they're cleared
+        // again for a connection without a client cert.
+        if ($config->ldap_client_tls_cert && $config->ldap_client_tls_key) {
+            $certPath = $config instanceof LdapConnection ? $config->clientCertPath() : Setting::get_client_side_cert_path();
+            $keyPath = $config instanceof LdapConnection ? $config->clientKeyPath() : Setting::get_client_side_key_path();
+            ldap_set_option(null, LDAP_OPT_X_TLS_CERTFILE, $certPath);
+            ldap_set_option(null, LDAP_OPT_X_TLS_KEYFILE, $keyPath);
+            self::$clientCertApplied = true;
+        } elseif (self::$clientCertApplied) {
+            ldap_set_option(null, LDAP_OPT_X_TLS_CERTFILE, '');
+            ldap_set_option(null, LDAP_OPT_X_TLS_KEYFILE, '');
+            self::$clientCertApplied = false;
         }
 
         $connection = @ldap_connect($ldap_host);
@@ -89,6 +160,8 @@ class Ldap extends Model
         if (! $connection) {
             throw new Exception('Could not connect to LDAP server at '.$ldap_host.'. Please check your LDAP server name and port number in your settings.');
         }
+
+        self::applyConnectionTlsOptions($connection, $config);
 
         // Needed for AD
         ldap_set_option($connection, LDAP_OPT_REFERRALS, 0);
@@ -102,6 +175,42 @@ class Ldap extends Model
         }
 
         return $connection;
+    }
+
+    /**
+     * Give this connection handle its own TLS context.
+     *
+     * libldap builds one process-wide TLS context on first use and keeps
+     * reusing it, so the global ldap_set_option(null, ...) calls above can
+     * be ignored for every LDAP connection after the first in a process
+     * (an ldap-sync run over several directories, a long-lived PHP-FPM
+     * worker). Setting the options on the handle and asking for a new
+     * context makes each directory use its own cert checking, CA file and
+     * client cert.
+     *
+     * Only for LdapConnection configs, and only where the PHP ldap
+     * extension exposes LDAP_OPT_X_TLS_NEWCTX; otherwise the global
+     * options alone apply, as before multiple connections existed.
+     * Must run right after ldap_connect(), before STARTTLS or any bind.
+     */
+    public static function applyConnectionTlsOptions($connection, object $config): void
+    {
+        if (! $config instanceof LdapConnection || ! defined('LDAP_OPT_X_TLS_NEWCTX')) {
+            return;
+        }
+
+        ldap_set_option($connection, LDAP_OPT_X_TLS_REQUIRE_CERT, $config->ldap_server_cert_ignore ? LDAP_OPT_X_TLS_NEVER : LDAP_OPT_X_TLS_DEMAND);
+
+        if (config('app.ldap_tls_cacert')) {
+            ldap_set_option($connection, LDAP_OPT_X_TLS_CACERTFILE, config('app.ldap_tls_cacert'));
+        }
+
+        if ($config->ldap_client_tls_cert && $config->ldap_client_tls_key) {
+            ldap_set_option($connection, LDAP_OPT_X_TLS_CERTFILE, $config->clientCertPath());
+            ldap_set_option($connection, LDAP_OPT_X_TLS_KEYFILE, $config->clientKeyPath());
+        }
+
+        ldap_set_option($connection, LDAP_OPT_X_TLS_NEWCTX, 0);
     }
 
     /**
@@ -190,7 +299,7 @@ class Ldap extends Model
      */
     public static function findAndBindUserLdap($username, $password)
     {
-        $settings = Setting::getSettings();
+        $settings = self::config();
         $connection = self::connectToLdap();
         $ldap_username_field = $settings->ldap_username_field;
         $baseDn = $settings->ldap_basedn;
@@ -208,12 +317,12 @@ class Ldap extends Model
                 // Hopefully, in a later release, we can remove it from the settings.
                 // This logic instead just means that if we're using UPN, we don't append ad_domain, if we aren't, then we do.
                 // Hopefully that should handle all of our use cases, but if not we can backport our old logic.
-                $userDn = ($settings->ad_domain != '') ? $username.'@'.$settings->ad_domain : $username.'@'.$settings->email_domain;
+                $userDn = ($settings->ad_domain != '') ? $username.'@'.$settings->ad_domain : $username.'@'.Setting::getSettings()->email_domain;
             }
         }
 
         $filterQuery = $settings->ldap_auth_filter_query.ldap_escape($username, '', LDAP_ESCAPE_FILTER);
-        $filter = Setting::getSettings()->ldap_filter; // FIXME - this *does* respect the ldap filter, but I believe that AdLdap2 did *not*.
+        $filter = $settings->ldap_filter; // FIXME - this *does* respect the ldap filter, but I believe that AdLdap2 did *not*.
         $filterQuery = "({$filter}({$filterQuery}))";
 
         Log::debug('Filter query: '.$filterQuery);
@@ -234,7 +343,7 @@ class Ldap extends Model
             Log::debug("Status of binding user: $userDn to directory: (directly!) ".($ldapbind ? 'success' : 'FAILURE'));
             // replicate the old bad-decryption-key detection behavior here
             try {
-                Crypt::decrypt(Setting::getSettings()->ldap_pword);
+                Crypt::decrypt(self::config()->ldap_pword);
             } catch (Exception $e) {
                 throw new Exception('Your app key has changed! Could not decrypt LDAP password using your current app key, so LDAP authentication has been disabled. Login with a local account, update the LDAP password and re-enable it in Admin > Settings.');
             }
@@ -323,7 +432,7 @@ class Ldap extends Model
      */
     public static function bindAdminToLdap($connection): void
     {
-        $settings = Setting::getSettings();
+        $settings = self::config();
 
         $ldap_username = $settings->ldap_uname;
 
@@ -394,12 +503,12 @@ class Ldap extends Model
      * they're written to Settings. Any object exposing the same
      * `ldap_*` properties works.
      *
-     * @param  object|null  $source  Setting-shaped object; defaults to Setting::getSettings()
+     * @param  object|null  $source  Setting-shaped object; defaults to self::config()
      * @return array<string, ?string>
      */
     public static function attributeMap(?object $source = null): array
     {
-        $source ??= Setting::getSettings();
+        $source ??= self::config();
 
         return [
             'username' => $source->ldap_username_field,
@@ -581,7 +690,10 @@ class Ldap extends Model
     }
 
     /**
-     * Add the user to the company named by the mapped LDAP attribute.
+     * Add the user to the company chosen by the active connection's
+     * company source: the connection's fixed company, the company named by
+     * the mapped LDAP attribute, or none. The legacy settings row has no
+     * company source, so there the attribute mapping alone decides.
      *
      * Must run after the user is saved, since memberships live on the
      * company_user pivot. users.ldap_company_id tracks the membership LDAP
@@ -593,17 +705,20 @@ class Ldap extends Model
      */
     public static function applyLdapCompanyToUser(User $user, array $ldapAttr): void
     {
-        $companyName = trim((string) ($ldapAttr['company'] ?? ''));
-        if (! $user->exists || self::attributeMap()['company'] == '' || $companyName === '') {
+        if (! $user->exists) {
             return;
         }
 
-        $company = self::findOrCreateCompanyByName($companyName);
+        $company = self::resolveLdapCompany($ldapAttr);
+        if ($company === null) {
+            return;
+        }
         $previousLdapCompanyId = $user->ldap_company_id ? (int) $user->ldap_company_id : null;
 
         $currentIds = array_map('intval', $user->companies()->pluck('companies.id')->all());
         $newIds = $currentIds;
-        if ($previousLdapCompanyId !== null && $previousLdapCompanyId !== $company->id) {
+        if ($previousLdapCompanyId !== null && $previousLdapCompanyId !== $company->id
+            && ! self::companyClaimedByLinks($user, $previousLdapCompanyId)) {
             $newIds = array_values(array_diff($newIds, [$previousLdapCompanyId]));
         }
         if (! in_array($company->id, $newIds, true)) {
@@ -620,6 +735,164 @@ class Ldap extends Model
             $user->ldap_company_id = $company->id;
             $user->syncOriginalAttribute('ldap_company_id');
         }
+    }
+
+    /**
+     * The user another connection owns that has the same employee number
+     * as this LDAP entry, when the active connection links users by
+     * employee number. Only a single match counts.
+     *
+     * @param  array  $ldapAttr  Output of parseAndMapLdapAttributes()
+     */
+    public static function findLinkableUser(array $ldapAttr): ?User
+    {
+        $connection = self::currentConnection();
+        $employeeNumber = trim((string) ($ldapAttr['employee_num'] ?? ''));
+        if (! $connection || ! $connection->link_by_employee_number || $employeeNumber === '') {
+            return null;
+        }
+
+        // A user this connection already linked stays linked, even if their
+        // owner connection has since been detached.
+        $alreadyLinked = User::where('employee_num', $employeeNumber)
+            ->whereIn('id', DB::table('ldap_connection_user')->where('ldap_connection_id', $connection->id)->select('user_id'))
+            ->limit(2)
+            ->get();
+        if ($alreadyLinked->count() === 1) {
+            return $alreadyLinked->first();
+        }
+
+        $matches = User::where('ldap_import', 1)
+            ->whereNotNull('ldap_connection_id')
+            ->where('ldap_connection_id', '!=', $connection->id)
+            ->where('employee_num', $employeeNumber)
+            ->limit(2)
+            ->get();
+
+        return $matches->count() === 1 ? $matches->first() : null;
+    }
+
+    /**
+     * Link a user owned by another connection to the active connection:
+     * add the company this connection assigns, without touching the
+     * profile. A changed company replaces the one this link added before;
+     * an empty value keeps it.
+     *
+     * @param  User  $user  User owned by another connection
+     * @param  array  $ldapAttr  Output of parseAndMapLdapAttributes()
+     */
+    public static function linkUserToCurrentConnection(User $user, array $ldapAttr): void
+    {
+        $connection = self::currentConnection();
+        if (! $connection) {
+            return;
+        }
+
+        $link = DB::table('ldap_connection_user')
+            ->where('ldap_connection_id', $connection->id)
+            ->where('user_id', $user->id)
+            ->first();
+        $previousCompanyId = $link?->company_id ? (int) $link->company_id : null;
+        $companyId = self::resolveLdapCompany($ldapAttr)->id ?? $previousCompanyId;
+
+        if ($companyId !== $previousCompanyId) {
+            $currentIds = array_map('intval', $user->companies()->pluck('companies.id')->all());
+            $newIds = $currentIds;
+            if ($previousCompanyId !== null && ! self::companyClaimedElsewhere($user, $previousCompanyId, $connection->id)) {
+                $newIds = array_values(array_diff($newIds, [$previousCompanyId]));
+            }
+            if ($companyId !== null && ! in_array($companyId, $newIds, true)) {
+                $newIds[] = $companyId;
+            }
+            if ($newIds !== $currentIds) {
+                $user->syncCompaniesWithLogging($newIds);
+            }
+        }
+
+        DB::table('ldap_connection_user')->updateOrInsert(
+            ['ldap_connection_id' => $connection->id, 'user_id' => $user->id],
+            ['company_id' => $companyId, 'updated_at' => now(), 'created_at' => $link->created_at ?? now()],
+        );
+    }
+
+    /**
+     * Remove a connection's link to a user, together with the company the
+     * link added unless the owner or another link also assigns it.
+     */
+    public static function unlinkUserFromConnection(User $user, LdapConnection $connection): void
+    {
+        $link = DB::table('ldap_connection_user')
+            ->where('ldap_connection_id', $connection->id)
+            ->where('user_id', $user->id)
+            ->first();
+        if (! $link) {
+            return;
+        }
+
+        $companyId = $link->company_id ? (int) $link->company_id : null;
+        if ($companyId !== null && ! self::companyClaimedElsewhere($user, $companyId, $connection->id)) {
+            $currentIds = array_map('intval', $user->companies()->pluck('companies.id')->all());
+            if (in_array($companyId, $currentIds, true)) {
+                $user->syncCompaniesWithLogging(array_values(array_diff($currentIds, [$companyId])));
+            }
+        }
+
+        DB::table('ldap_connection_user')->where('id', $link->id)->delete();
+    }
+
+    /**
+     * Whether the owning connection or a link other than $exceptConnectionId
+     * assigned this company to the user.
+     */
+    protected static function companyClaimedElsewhere(User $user, int $companyId, int $exceptConnectionId): bool
+    {
+        return (int) $user->ldap_company_id === $companyId
+            || DB::table('ldap_connection_user')
+                ->where('user_id', $user->id)
+                ->where('company_id', $companyId)
+                ->where('ldap_connection_id', '!=', $exceptConnectionId)
+                ->exists();
+    }
+
+    /**
+     * Whether any link assigned this company to the user.
+     */
+    protected static function companyClaimedByLinks(User $user, int $companyId): bool
+    {
+        return DB::table('ldap_connection_user')
+            ->where('user_id', $user->id)
+            ->where('company_id', $companyId)
+            ->exists();
+    }
+
+    /**
+     * The company applyLdapCompanyToUser() should assign, or null to leave
+     * memberships alone.
+     *
+     * @param  array  $ldapAttr  Output of parseAndMapLdapAttributes()
+     */
+    protected static function resolveLdapCompany(array $ldapAttr): ?Company
+    {
+        $config = self::config();
+        $companySource = $config->company_source
+            ?? (trim((string) $config->ldap_company) !== '' ? LdapConnection::COMPANY_SOURCE_ATTRIBUTE : LdapConnection::COMPANY_SOURCE_NONE);
+
+        if ($companySource === LdapConnection::COMPANY_SOURCE_CONNECTION) {
+            return $config->company_id
+                ? Company::withoutGlobalScope(CompanyableScope::class)->find($config->company_id)
+                : null;
+        }
+
+        if ($companySource === LdapConnection::COMPANY_SOURCE_ATTRIBUTE) {
+            $companyName = trim((string) ($ldapAttr['company'] ?? ''));
+            if (self::attributeMap()['company'] == '' || $companyName === '') {
+                return null;
+            }
+
+            return self::findOrCreateCompanyByName($companyName);
+        }
+
+        return null;
     }
 
     /**
@@ -659,10 +932,11 @@ class Ldap extends Model
             return false;
         }
 
-        $settings = Setting::getSettings();
+        $settings = self::config();
 
         $user = new User;
         self::applyLdapAttributesToUser($user, $item);
+        $user->ldap_connection_id = self::currentConnection()?->id;
 
         $user->locale = app()->getLocale();
         $user->password = $user->noPassword();
@@ -711,10 +985,10 @@ class Ldap extends Model
         self::bindAdminToLdap($ldapconn);
         // Default to global base DN if nothing else is provided.
         if (is_null($base_dn)) {
-            $base_dn = Setting::getSettings()->ldap_basedn;
+            $base_dn = self::config()->ldap_basedn;
         }
         if ($filter === null) {
-            $filter = Setting::getSettings()->ldap_filter;
+            $filter = self::config()->ldap_filter;
         }
 
         // Set up LDAP pagination for very large databases

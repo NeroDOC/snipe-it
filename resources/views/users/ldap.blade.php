@@ -22,6 +22,27 @@
                    
                 </x-callout>
 
+                @php
+                    $enabledLdapConnections = \App\Models\LdapConnection::enabled()->pluck('name', 'id');
+                @endphp
+                @if ($enabledLdapConnections->count() > 1)
+                    <x-form.row
+                        name="connection_id"
+                        :label="trans('admin/settings/general.ldap_connections.connection')"
+                        :help_text="trans('admin/settings/general.ldap_connections.import_connection_help')"
+                    >
+                        <x-slot:input>
+                            <x-input.select
+                                name="connection_id"
+                                id="connection_id"
+                                :options="['' => trans('admin/settings/general.ldap_connections.all_enabled')] + $enabledLdapConnections->all()"
+                                :selected="old('connection_id')"
+                                style="width: 100%"
+                            />
+                        </x-slot:input>
+                    </x-form.row>
+                @endif
+
                 <x-input.location-select
                     :label="trans('general.ldap_sync_location')"
                     name="location_id[]"

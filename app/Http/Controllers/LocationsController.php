@@ -87,6 +87,9 @@ class LocationsController extends Controller
         $location->country = $request->input('country');
         $location->zip = $request->input('zip');
         $location->ldap_ou = $request->input('ldap_ou');
+        if ($request->has('ldap_connection_id')) {
+            $location->ldap_connection_id = $request->input('ldap_connection_id') ?: null;
+        }
         $location->manager_id = $request->input('manager_id');
         $location->created_by = auth()->id();
         $location->phone = request('phone');
@@ -181,6 +184,9 @@ class LocationsController extends Controller
         $location->phone = request('phone');
         $location->fax = request('fax');
         $location->ldap_ou = $request->input('ldap_ou');
+        if ($request->has('ldap_connection_id')) {
+            $location->ldap_connection_id = $request->input('ldap_connection_id') ?: null;
+        }
         $location->manager_id = $request->input('manager_id');
         $location->tag_color = $request->input('tag_color');
         $location->notes = $request->input('notes');

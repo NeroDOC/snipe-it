@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Models\Asset;
 use App\Models\CustomField;
+use App\Models\LdapConnection;
 use App\Models\Setting;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Encryption\DecryptException;
@@ -123,6 +124,17 @@ class RotateAppKey extends Command
                     $this->warn('LDAP password has been re-encrypted.');
                 } catch (DecryptException $e) {
                     $this->warn('Unable to decrypt old LDAP password; skipping');
+                }
+            }
+
+            // ...and every LDAP connection's bind password
+            foreach (LdapConnection::whereNotNull('ldap_pword')->where('ldap_pword', '!=', '')->get() as $connection) {
+                try {
+                    $connection->ldap_pword = $newEncrypter->encrypt($oldEncrypter->decrypt($connection->ldap_pword));
+                    $connection->forceSave();
+                    $this->warn('LDAP password for connection "'.$connection->name.'" has been re-encrypted.');
+                } catch (DecryptException $e) {
+                    $this->warn('Unable to decrypt old LDAP password for connection "'.$connection->name.'"; skipping');
                 }
             }
         } else {

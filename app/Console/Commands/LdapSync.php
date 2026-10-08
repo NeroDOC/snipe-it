@@ -6,11 +6,16 @@ use App\Models\Actionlog;
 use App\Models\Asset;
 use App\Models\Group;
 use App\Models\Ldap;
+use App\Models\LdapConnection;
 use App\Models\Location;
 use App\Models\Setting;
 use App\Models\User;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Str;
+use Symfony\Component\Process\PhpExecutableFinder;
 
 class LdapSync extends Command
 {
@@ -19,7 +24,7 @@ class LdapSync extends Command
      *
      * @var string
      */
-    protected $signature = 'snipeit:ldap-sync {--location=} {--location_id=*} {--base_dn=} {--filter=} {--delete} {--summary} {--json_summary}';
+    protected $signature = 'snipeit:ldap-sync {--connection=} {--location=} {--location_id=*} {--base_dn=} {--filter=} {--delete} {--summary} {--json_summary}';
 
     /**
      * The console command description.
@@ -64,6 +69,215 @@ class LdapSync extends Command
         ini_set('max_execution_time', config('app.ldap_time_limit')); // 600 seconds = 10 minutes
         ini_set('memory_limit', config('app.ldap_memory_limit'));
 
+        $connections = $this->connectionsToSync();
+
+        // Installs without LDAP connections sync the legacy settings row.
+        if ($connections === null) {
+            try {
+                $summary = $this->syncCurrentConnection();
+            } catch (\RuntimeException $e) {
+                return $this->reportFatalError($e->getMessage());
+            }
+
+            return $this->outputSummary($summary);
+        }
+
+        if ($connections->isEmpty()) {
+            return $this->reportFatalError($this->option('connection') != ''
+                ? trans('admin/settings/general.ldap_connections.connection_unavailable', ['id' => $this->option('connection')])
+                : trans('admin/settings/general.ldap_connections.none_enabled'));
+        }
+
+        // A single directory syncs in this process and, failing, aborts
+        // the run, as before multiple connections existed.
+        if ($connections->count() === 1) {
+            try {
+                $summary = Ldap::withConnection($connections->first(), fn () => $this->syncCurrentConnection());
+            } catch (\RuntimeException $e) {
+                return $this->reportFatalError($e->getMessage());
+            }
+
+            return $this->outputSummary($summary);
+        }
+
+        // Several directories: each one syncs in its own child process.
+        // libldap keeps a process-wide TLS context, so directories with
+        // different CA / cert-checking / client-cert settings can't be
+        // trusted to get their own settings inside one process. A failing
+        // directory shows up as a row in the summary; the others still sync.
+        $summary = [];
+        foreach ($connections as $connection) {
+            $summary = array_merge($summary, $this->syncConnectionInChildProcess($connection));
+        }
+
+        return $this->outputSummary($summary);
+    }
+
+    /**
+     * Run `snipeit:ldap-sync --connection=<id> --json_summary` for one
+     * connection in a fresh PHP process, passing the other options
+     * through, and return that run's summary rows.
+     */
+    private function syncConnectionInChildProcess(LdapConnection $connection): array
+    {
+        $command = [
+            (new PhpExecutableFinder)->find(false) ?: 'php',
+            base_path('artisan'),
+            'snipeit:ldap-sync',
+            '--connection='.$connection->id,
+            '--json_summary',
+        ];
+        foreach (['location', 'base_dn', 'filter'] as $option) {
+            if ($this->option($option) != '') {
+                $command[] = '--'.$option.'='.$this->option($option);
+            }
+        }
+        if ($this->option('delete')) {
+            $command[] = '--delete';
+        }
+
+        $result = Process::forever()->path(base_path())->env($this->childProcessEnvironment())->run($command);
+
+        // The child prints exactly one JSON line; take the last one in
+        // case anything else (deprecation notices, ...) got printed first.
+        $payload = null;
+        foreach (array_reverse(preg_split('/\R/', trim($result->output()))) as $line) {
+            $decoded = json_decode($line, true);
+            if (is_array($decoded) && array_key_exists('summary', $decoded)) {
+                $payload = $decoded;
+                break;
+            }
+        }
+
+        if ($payload === null) {
+            // PHP writes fatal errors to stdout in CLI, so fall back to it.
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $message = 'LDAP sync process exited with code '.$result->exitCode()
+                .($details !== '' ? ': '.Str::limit(preg_replace('/\s+/', ' ', $details), 500) : '');
+            Log::warning('LDAP sync for connection '.$connection->name.' failed', [
+                'exit_code' => $result->exitCode(),
+                'output' => $result->output(),
+                'error_output' => $result->errorOutput(),
+            ]);
+
+            return [$this->connectionErrorRow($connection, $message)];
+        }
+
+        if (! empty($payload['error'])) {
+            return [$this->connectionErrorRow($connection, (string) $payload['error_message'])];
+        }
+
+        return $payload['summary'];
+    }
+
+    /**
+     * Environment for a child sync process: this process's environment
+     * plus the database and app key it is actually using, so the child
+     * reads the same database however this process got its config
+     * (exported variables, per-command variables, a web request).
+     *
+     * @return array<string, string>
+     */
+    private function childProcessEnvironment(): array
+    {
+        $connectionName = config('database.default');
+        $connection = config('database.connections.'.$connectionName, []);
+
+        $environment = array_filter(getenv(), fn ($key) => ! str_starts_with($key, 'HTTP_'), ARRAY_FILTER_USE_KEY);
+        $effective = array_filter([
+            'APP_ENV' => app()->environment(),
+            'APP_KEY' => config('app.key'),
+            'DB_CONNECTION' => $connectionName,
+            'DB_HOST' => $connection['host'] ?? null,
+            'DB_PORT' => $connection['port'] ?? null,
+            'DB_DATABASE' => $connection['database'] ?? null,
+            'DB_USERNAME' => $connection['username'] ?? null,
+            'DB_PASSWORD' => $connection['password'] ?? null,
+        ], fn ($value) => $value !== null && $value !== '');
+
+        return array_merge($environment, array_map('strval', $effective));
+    }
+
+    /**
+     * Summary row for a connection that couldn't be synced. Carries every
+     * key the import page's results table reads.
+     */
+    private function connectionErrorRow(LdapConnection $connection, string $message): array
+    {
+        return [
+            'connection' => $connection->name,
+            'username' => '',
+            'display_name' => '',
+            'employee_num' => '',
+            'first_name' => '',
+            'last_name' => '',
+            'email' => '',
+            'createorupdate' => 'skipped',
+            'status' => 'error',
+            'note' => $message,
+        ];
+    }
+
+    /**
+     * The connections this run covers, or null on an install that has no
+     * LDAP connections yet (legacy single-LDAP settings row).
+     *
+     * --connection picks one; --location_id implies the connection that
+     * location's OU belongs to; otherwise every enabled connection.
+     *
+     * @return \Illuminate\Support\Collection<int, LdapConnection>|null
+     */
+    private function connectionsToSync(): ?\Illuminate\Support\Collection
+    {
+        if (! LdapConnection::query()->exists()) {
+            return null;
+        }
+
+        if ($this->option('connection') != '') {
+            $connection = LdapConnection::find($this->option('connection'));
+            if (! $connection || ! $connection->enabled) {
+                return collect();
+            }
+
+            return collect([$connection]);
+        }
+
+        if ($this->option('location_id')) {
+            $location = Location::find(collect($this->option('location_id'))->last());
+            $connection = $location?->ldap_connection_id
+                ? LdapConnection::find($location->ldap_connection_id)
+                : LdapConnection::defaultConnection();
+
+            return ($connection && $connection->enabled) ? collect([$connection]) : collect();
+        }
+
+        return LdapConnection::enabled()->get();
+    }
+
+    /**
+     * Same output as a pre-connections run aborting: JSON error envelope
+     * when asked for one, and an empty summary.
+     */
+    private function reportFatalError(string $message): array
+    {
+        if ($this->option('json_summary')) {
+            $json_summary = ['error' => true, 'error_message' => $message, 'summary' => []];
+            $this->info(json_encode($json_summary));
+        } else {
+            $this->error($message);
+        }
+
+        return [];
+    }
+
+    /**
+     * Sync users from the active LDAP config (Ldap::config()). Throws a
+     * RuntimeException when the directory can't be reached or searched.
+     */
+    private function syncCurrentConnection(): array
+    {
+        $current_connection = Ldap::currentConnection();
+
         // Single source of truth for internal-key => LDAP-attribute-name
         // lives on the Ldap model so parseAndMapLdapAttributes and this
         // command can't drift. Used here for the LDAP query attribute
@@ -71,24 +285,21 @@ class LdapSync extends Command
         // manager, location, username) that only LdapSync needs.
         $ldap_map = Ldap::attributeMap();
 
-        $ldap_default_group = Setting::getSettings()->ldap_default_group;
-        $search_base = Setting::getSettings()->ldap_base_dn;
+        $ldap_default_group = Ldap::config()->ldap_default_group;
+        $search_base = Ldap::config()->ldap_basedn;
 
         try {
             $ldapconn = Ldap::connectToLdap();
             Ldap::bindAdminToLdap($ldapconn);
         } catch (\Exception $e) {
-            if ($this->option('json_summary')) {
-                $json_summary = ['error' => true, 'error_message' => $e->getMessage(), 'summary' => []];
-                $this->info(json_encode($json_summary));
-            }
             Log::info($e);
 
-            return [];
+            throw new \RuntimeException($this->connectionLabel($current_connection).$e->getMessage(), 0, $e);
         }
 
         $summary = [];
         $seen_ldap_usernames = [];
+        $linked_user_ids = [];
 
         try {
 
@@ -127,20 +338,16 @@ class LdapSync extends Command
              */
             $attributes = array_values(array_filter($ldap_map));
 
-            if (Setting::getSettings()->is_ad === 1 && is_null($ldap_map['activated'])) {
+            if ((int) Ldap::config()->is_ad === 1 && is_null($ldap_map['activated'])) {
                 $attributes[] = 'useraccountcontrol';
             }
 
             $results = Ldap::findLdapUsers($search_base, -1, $filter, $attributes);
 
         } catch (\Exception $e) {
-            if ($this->option('json_summary')) {
-                $json_summary = ['error' => true, 'error_message' => $e->getMessage(), 'summary' => []];
-                $this->info(json_encode($json_summary));
-            }
             Log::info($e);
 
-            return [];
+            throw new \RuntimeException($this->connectionLabel($current_connection).$e->getMessage(), 0, $e);
         }
 
         /* Determine which location to assign users to by default. */
@@ -168,7 +375,7 @@ class LdapSync extends Command
         /* Process locations with explicitly defined OUs, if doing a full import. */
         if ($this->option('base_dn') == '' && $this->option('filter') == '') {
             // Retrieve locations with a mapped OU, and sort them from the shallowest to deepest OU (see #3993)
-            $ldap_ou_locations = Location::where('ldap_ou', '!=', '')->get()->toArray();
+            $ldap_ou_locations = $this->ouLocationsFor($current_connection)->toArray();
             $ldap_ou_lengths = [];
 
             foreach ($ldap_ou_locations as $ou_loc) {
@@ -192,13 +399,9 @@ class LdapSync extends Command
                 try {
                     $location_users = Ldap::findLdapUsers($ldap_loc['ldap_ou']);
                 } catch (\Exception $e) { // TODO: this is stolen from line 77 or so above
-                    if ($this->option('json_summary')) {
-                        $json_summary = ['error' => true, 'error_message' => trans('admin/users/message.error.ldap_could_not_search').' Location: '.$ldap_loc['name'].' (ID: '.$ldap_loc['id'].') cannot connect to "'.$ldap_loc['ldap_ou'].'" - '.$e->getMessage(), 'summary' => []];
-                        $this->info(json_encode($json_summary));
-                    }
                     Log::info($e);
 
-                    return [];
+                    throw new \RuntimeException($this->connectionLabel($current_connection).trans('admin/users/message.error.ldap_could_not_search').' Location: '.$ldap_loc['name'].' (ID: '.$ldap_loc['id'].') cannot connect to "'.$ldap_loc['ldap_ou'].'" - '.$e->getMessage(), 0, $e);
                 }
                 $usernames = [];
                 for ($i = 0; $i < $location_users['count']; $i++) {
@@ -251,6 +454,43 @@ class LdapSync extends Command
             if (! empty($item['username'])) {
                 $seen_ldap_usernames[] = $item['username'];
             }
+            $item['connection'] = $current_connection?->name;
+            $ownedByOtherConnection = $user && $current_connection && $user->ldap_import == '1' && $user->ldap_connection_id
+                && (int) $user->ldap_connection_id !== $current_connection->id;
+
+            // The same person in another directory, matched by employee
+            // number: add this connection's company to their account
+            // instead of creating a second one. Profile stays with the owner.
+            // A deleted account of this connection (e.g. merged into the
+            // owner's account) is linked past instead of restored.
+            $canLink = ! $user || $ownedByOtherConnection || $user->trashed();
+            $linkedUser = $canLink ? Ldap::findLinkableUser($item) : null;
+            if ($linkedUser && (! $user || $user->trashed() || $linkedUser->id === $user->id)) {
+                Ldap::linkUserToCurrentConnection($linkedUser, $item);
+                $linked_user_ids[] = $linkedUser->id;
+                $item['id'] = $linkedUser->id;
+                $item['createorupdate'] = 'linked';
+                $item['status'] = 'success';
+                $item['note'] = trans('admin/settings/general.ldap_connections.linked_to', [
+                    'username' => $linkedUser->username,
+                    'id' => $linkedUser->ldap_connection_id,
+                ]);
+                $summary[] = $item;
+
+                continue;
+            }
+
+            // Never take over a user another LDAP connection owns. Usernames
+            // can collide across directories; the owning connection keeps
+            // the account.
+            if ($ownedByOtherConnection) {
+                $item['createorupdate'] = 'skipped';
+                $item['status'] = 'info';
+                $item['note'] = trans('admin/settings/general.ldap_connections.owned_by_other', ['id' => $user->ldap_connection_id]);
+                $summary[] = $item;
+
+                continue;
+            }
             if ($user) {
                 if ($user->trashed()) {
                     $user->restore();
@@ -284,7 +524,10 @@ class LdapSync extends Command
                     } else {
                         // Get the LDAP Manager
                         try {
-                            $ldap_manager = Ldap::findLdapUsers($item['manager'], -1, $this->option('filter'));
+                            // The DN identifies the manager on its own; the user filter
+                            // could exclude them (e.g. a manager synced from another
+                            // connection), so search the DN without it.
+                            $ldap_manager = Ldap::findLdapUsers($item['manager'], -1, '(objectClass=*)');
                         } catch (\Exception $e) {
                             Log::warning('Manager lookup caused an exception: '.$e->getMessage().'. Falling back to direct username lookup');
                             // Hail-mary for Okta manager 'shortnames' - will only work if
@@ -300,11 +543,7 @@ class LdapSync extends Command
                         $add_manager_to_cache = true;
                         if ($ldap_manager['count'] > 0) {
                             try {
-                                // Get the Manager's username
-                                // PHP LDAP returns every LDAP attribute as an array, and 90% of the time it's an array of just one item. But, hey, it's an array.
-                                $ldapManagerUsername = $ldap_manager[0][$ldap_map['username']][0];
-
-                                $ldap_manager = self::findLocalUserForLdapUsername((string) $ldapManagerUsername);
+                                $ldap_manager = self::findLocalManager($ldap_manager[0], $ldap_map);
 
                                 if ($ldap_manager && isset($ldap_manager->id)) {
                                     // Link user to manager id.
@@ -332,7 +571,7 @@ class LdapSync extends Command
 
                 $boolean_cast = (bool) $raw_value;
 
-                if (Setting::getSettings()->ldap_invert_active_flag === 1) {
+                if ((int) Ldap::config()->ldap_invert_active_flag === 1) {
                     // Because ldap_active_flag is set, if filter_var is true or boolean_cast is true, then user is suspended
                     $user->activated = ! ($filter_var ?? $boolean_cast);
                 } else {
@@ -402,6 +641,7 @@ class LdapSync extends Command
             // could clobber a location an admin set by hand.
 
             $user->ldap_import = 1;
+            $user->ldap_connection_id = $current_connection->id ?? $user->ldap_connection_id;
 
             $errors = '';
 
@@ -442,6 +682,11 @@ class LdapSync extends Command
         // users with assests etc. are not deletable and skipped
         if ($this->option('delete')) {
             $missing_ldap_users = User::where('ldap_import', 1);
+            // Only this connection's users: another directory's users are
+            // never "missing" from this one.
+            if ($current_connection) {
+                $missing_ldap_users = $missing_ldap_users->where('ldap_connection_id', $current_connection->id);
+            }
             $missing_ldap_users = $missing_ldap_users->whereNotIn('username', $seen_ldap_usernames);
             $missing_ldap_users = $missing_ldap_users->get();
 
@@ -472,12 +717,48 @@ class LdapSync extends Command
                     $missing_item['note'] = 'deleted_missing_from_ldap';
                 }
 
+                $missing_item['connection'] = $current_connection?->name;
                 $summary[] = $missing_item;
+            }
+
+            // Links to people no longer in this directory: drop the company
+            // this connection added; their account stays with its owner.
+            if ($current_connection) {
+                $stale_links = User::whereIn('id', DB::table('ldap_connection_user')
+                    ->where('ldap_connection_id', $current_connection->id)
+                    ->whereNotIn('user_id', $linked_user_ids)
+                    ->pluck('user_id'))->get();
+                foreach ($stale_links as $linked_user) {
+                    Ldap::unlinkUserFromConnection($linked_user, $current_connection);
+                    $summary[] = [
+                        'connection' => $current_connection->name,
+                        'id' => $linked_user->id,
+                        'username' => $linked_user->username,
+                        'display_name' => (string) $linked_user->display_name,
+                        'employee_num' => (string) $linked_user->employee_num,
+                        'first_name' => $linked_user->first_name,
+                        'last_name' => $linked_user->last_name,
+                        'email' => $linked_user->email,
+                        'createorupdate' => 'unlinked',
+                        'status' => 'success',
+                        'note' => trans('admin/settings/general.ldap_connections.unlinked'),
+                    ];
+                }
             }
         }
 
+        return $summary;
+    }
+
+    /**
+     * Print the summary as a table or JSON, or return it for callers that
+     * asked for neither.
+     */
+    private function outputSummary(array $summary)
+    {
         if ($this->option('summary')) {
             $rows = array_map(fn ($row) => [
+                $row['connection'] ?? '',
                 $row['username'] ?? '',
                 trim(($row['first_name'] ?? '').' '.($row['last_name'] ?? '')),
                 strtoupper($row['createorupdate'] ?? ''),
@@ -486,7 +767,7 @@ class LdapSync extends Command
             ], $summary);
 
             $this->table(
-                ['Username', 'Name', 'Action', 'Status', 'Note'],
+                ['Connection', 'Username', 'Name', 'Action', 'Status', 'Note'],
                 $rows,
             );
         } elseif ($this->option('json_summary')) {
@@ -495,6 +776,69 @@ class LdapSync extends Command
         } else {
             return $summary;
         }
+    }
+
+    /**
+     * Locations whose LDAP OU belongs to the given connection. Locations
+     * without a connection belong to the default connection; on the legacy
+     * settings row every OU location applies.
+     */
+    private function ouLocationsFor(?LdapConnection $connection): \Illuminate\Support\Collection
+    {
+        $query = Location::where('ldap_ou', '!=', '');
+
+        if ($connection) {
+            $isDefault = LdapConnection::defaultConnection()?->id === $connection->id;
+            $query->where(function ($query) use ($connection, $isDefault) {
+                $query->where('ldap_connection_id', $connection->id);
+                if ($isDefault) {
+                    $query->orWhereNull('ldap_connection_id');
+                }
+            });
+        }
+
+        return $query->get();
+    }
+
+    private function connectionLabel(?LdapConnection $connection): string
+    {
+        return $connection ? '['.$connection->name.'] ' : '';
+    }
+
+    /**
+     * Find the local user for a manager's LDAP entry: by username, then by
+     * email, then by employee number. The same person can have a different
+     * username in each directory, so the fallbacks only accept a single match.
+     *
+     * @param  array  $ldapEntry  The manager's LDAP entry
+     * @param  array<string, ?string>  $ldapMap  Ldap::attributeMap()
+     */
+    public static function findLocalManager(array $ldapEntry, array $ldapMap): ?User
+    {
+        $value = fn (?string $attribute) => $attribute ? trim((string) ($ldapEntry[strtolower($attribute)][0] ?? '')) : '';
+
+        $username = $value($ldapMap['username']);
+        if ($username !== '' && ($user = self::findLocalUserForLdapUsername($username))) {
+            return $user;
+        }
+
+        $email = $value($ldapMap['email']);
+        if ($email !== '') {
+            $matches = User::whereRaw('LOWER(email) = ?', [mb_strtolower($email)])->limit(2)->get();
+            if ($matches->count() === 1) {
+                return $matches->first();
+            }
+        }
+
+        $employeeNumber = $value($ldapMap['employee_num']);
+        if ($employeeNumber !== '') {
+            $matches = User::where('employee_num', $employeeNumber)->limit(2)->get();
+            if ($matches->count() === 1) {
+                return $matches->first();
+            }
+        }
+
+        return null;
     }
 
     /**

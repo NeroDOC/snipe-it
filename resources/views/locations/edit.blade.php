@@ -96,6 +96,29 @@
                         :$item
                         name="ldap_ou"
                     />
+
+                    {{-- Which LDAP connection the OU above belongs to. Only
+                         asked when there's more than one; otherwise the OU
+                         belongs to the only (default) connection. --}}
+                    @php
+                        $ldapConnectionOptions = \App\Models\LdapConnection::orderBy('priority')->orderBy('id')->pluck('name', 'id');
+                    @endphp
+                    @if ($ldapConnectionOptions->count() > 1)
+                        <x-form.row
+                            :label="trans('admin/settings/general.ldap_connections.connection')"
+                            name="ldap_connection_id"
+                        >
+                            <x-slot:input>
+                                <x-input.select
+                                    name="ldap_connection_id"
+                                    id="ldap_connection_id"
+                                    :options="['' => trans('admin/settings/general.ldap_connections.default_connection')] + $ldapConnectionOptions->all()"
+                                    :selected="old('ldap_connection_id', $item->ldap_connection_id)"
+                                    style="width: 100%"
+                                />
+                            </x-slot:input>
+                        </x-form.row>
+                    @endif
                 @endif
 
                 <x-input.image-upload :item="$item" :imagePath="app('locations_upload_path')" :clonedModel="$cloned_model ?? null" />

@@ -3,12 +3,14 @@
 namespace App\Livewire;
 
 use App\Models\Ldap;
+use App\Models\LdapConnection;
 use App\Models\Setting;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\RateLimiter;
 use Livewire\Attributes\Computed;
+use Livewire\Attributes\Locked;
 use Livewire\Attributes\Url;
 use Livewire\Component;
 
@@ -56,6 +58,12 @@ class LdapSettings extends Component
     #[Url(as: 'step')]
     public int $currentStep = 1;
 
+    // The LdapConnection being edited. Null while creating a new one;
+    // saveStep1() creates the row and fills this in.
+    #[Locked]
+    #[Url(as: 'connection')]
+    public ?int $connectionId = null;
+
     public int $highestStepReached = 1;
 
     // Flipped true by any updated() hook and back to false on successful
@@ -96,8 +104,13 @@ class LdapSettings extends Component
         'test_sample_username',
     ];
 
-    // Step 1: Connection
+    // Step 1: Connection. ldap_enabled mirrors the connection's own
+    // enabled flag, not the global settings switch.
     public bool $ldap_enabled = false;
+
+    public string $name = '';
+
+    public int $priority = 0;
 
     public bool $is_ad = false;
 
@@ -169,6 +182,16 @@ class LdapSettings extends Component
 
     public string $ldap_website = '';
 
+    // Where synced users get their company from: none, the company bound
+    // to this connection, or the mapped LDAP company attribute.
+    public string $company_source = LdapConnection::COMPANY_SOURCE_NONE;
+
+    public ?int $company_id = null;
+
+    // Match people another connection already owns by employee number and
+    // add this connection's company to their account instead of a duplicate.
+    public bool $link_by_employee_number = false;
+
     public string $ldap_active_flag = '';
 
     public bool $ldap_invert_active_flag = false;
@@ -207,6 +230,10 @@ class LdapSettings extends Component
 
     public function mount(): void
     {
+        if ($this->connectionId !== null) {
+            abort_unless(LdapConnection::whereKey($this->connectionId)->exists(), 404);
+        }
+
         $this->isReadOnly = (bool) config('app.lock_passwords');
         $this->hydrateFromPersisted();
 
@@ -255,20 +282,35 @@ class LdapSettings extends Component
 
     protected function progressSessionKey(): string
     {
-        return 'ldap_wizard_highest_step:'.auth()->id();
+        return 'ldap_wizard_highest_step:'.auth()->id().':'.($this->connectionId ?? 'new');
     }
 
     /**
-     * Load every wizard prop from the persisted Setting row. Called by
+     * The connection being edited, or a fresh unsaved one while creating.
+     */
+    protected function connection(): LdapConnection
+    {
+        return $this->connectionId !== null
+            ? LdapConnection::findOrFail($this->connectionId)
+            : new LdapConnection;
+    }
+
+    /**
+     * Load every wizard prop from the persisted connection. Called by
      * mount() on first render and by goToStep() when the user opts to
      * discard unsaved changes via the wire:confirm dialog. Password is
      * intentionally NOT hydrated (see property docstring).
      */
     protected function hydrateFromPersisted(): void
     {
-        $setting = Setting::getSettings();
+        $setting = $this->connection();
 
-        $this->ldap_enabled = (bool) $setting->ldap_enabled;
+        $this->ldap_enabled = (bool) $setting->enabled;
+        $this->name = (string) $setting->name;
+        $this->priority = (int) $setting->priority;
+        $this->company_source = (string) ($setting->company_source ?: LdapConnection::COMPANY_SOURCE_NONE);
+        $this->company_id = $setting->company_id ? (int) $setting->company_id : null;
+        $this->link_by_employee_number = (bool) $setting->link_by_employee_number;
         $this->is_ad = (bool) $setting->is_ad;
         $this->ad_domain = (string) $setting->ad_domain;
         $this->ldap_server = (string) $setting->ldap_server;
@@ -308,7 +350,8 @@ class LdapSettings extends Component
 
         $this->ldap_pw_sync = (bool) $setting->ldap_pw_sync;
         $this->ldap_default_group = $setting->ldap_default_group ? (int) $setting->ldap_default_group : null;
-        $this->custom_forgot_pass_url = (string) $setting->custom_forgot_pass_url;
+        // Global, not per connection.
+        $this->custom_forgot_pass_url = (string) Setting::getSettings()->custom_forgot_pass_url;
     }
 
     #[Computed]
@@ -334,7 +377,7 @@ class LdapSettings extends Component
     #[Computed]
     public function hasPersistedLdapPword(): bool
     {
-        return ! empty(Setting::getSettings()->ldap_pword);
+        return ! empty($this->connection()->ldap_pword);
     }
 
     public function goToStep(int $step): void
@@ -424,12 +467,14 @@ class LdapSettings extends Component
             }
         }
 
-        $setting = Setting::getSettings();
-        $setting->is_ad = $this->is_ad ? '1' : '0';
+        $setting = $this->connection();
+        $setting->name = $this->name;
+        $setting->priority = $this->priority;
+        $setting->is_ad = $this->is_ad;
         $setting->ad_domain = $this->ad_domain;
         $setting->ldap_server = $this->ldap_server;
-        $setting->ldap_tls = $this->ldap_tls ? '1' : '0';
-        $setting->ldap_server_cert_ignore = $this->ldap_server_cert_ignore ? '1' : '0';
+        $setting->ldap_tls = $this->ldap_tls;
+        $setting->ldap_server_cert_ignore = $this->ldap_server_cert_ignore;
         $setting->ldap_client_tls_key = $this->ldap_client_tls_key;
         $setting->ldap_client_tls_cert = $this->ldap_client_tls_cert;
 
@@ -461,6 +506,8 @@ class LdapSettings extends Component
     protected function step1SyntaxRules(): array
     {
         return [
+            'name' => 'required|string|max:191',
+            'priority' => 'integer',
             'ldap_server' => 'required|starts_with:ldap://,ldaps://',
             'ldap_client_tls_key' => [
                 'nullable',
@@ -503,6 +550,8 @@ class LdapSettings extends Component
     protected function step1SyntaxAttributes(): array
     {
         return [
+            'name' => trans('general.name'),
+            'priority' => trans('admin/settings/general.ldap_connections.priority'),
             'ldap_server' => trans('admin/settings/general.ldap_server'),
             'ldap_client_tls_key' => trans('admin/settings/general.ldap_client_tls_key'),
             'ldap_client_tls_cert' => trans('admin/settings/general.ldap_client_tls_cert'),
@@ -628,7 +677,7 @@ class LdapSettings extends Component
             }
         }
 
-        $setting = Setting::getSettings();
+        $setting = $this->connection();
 
         // SASL EXTERNAL uses the client cert as the identity, so both
         // uname and pword must be empty in the persisted state for
@@ -694,7 +743,7 @@ class LdapSettings extends Component
         // Laravel's validator skips closure rules on empty values by
         // default (same reason `nullable` works implicitly), which
         // would let a blank pword sail past a closure-based required.
-        $persisted = Setting::getSettings();
+        $persisted = $this->connection();
         $unameUnchanged = trim($this->ldap_uname) === trim((string) $persisted->ldap_uname);
         $canReusePersisted = $unameUnchanged && ! empty($persisted->ldap_pword);
 
@@ -780,7 +829,7 @@ class LdapSettings extends Component
         // gets passed. Simple bind path resolves the password from the
         // form value first, otherwise falls back to the persisted
         // encrypted password when the username matches.
-        $settings = Setting::getSettings();
+        $settings = $this->connection();
         $server = (string) $settings->ldap_server;
 
         if ($this->isSaslExternalCandidate()) {
@@ -891,7 +940,10 @@ class LdapSettings extends Component
         // that's an optional sanity check the user runs on demand to make sure
         // their syncs will look right and map all of the right fields, not
         // a network gate we run for them. Save + advance to step 5.
-        $setting = Setting::getSettings();
+        $setting = $this->connection();
+        $setting->company_source = $this->company_source;
+        $setting->company_id = $this->company_source === LdapConnection::COMPANY_SOURCE_CONNECTION ? $this->company_id : null;
+        $setting->link_by_employee_number = $this->link_by_employee_number;
         $setting->ldap_username_field = $this->ldap_username_field;
         $setting->ldap_fname_field = $this->ldap_fname_field;
         $setting->ldap_lname_field = $this->ldap_lname_field;
@@ -912,7 +964,7 @@ class LdapSettings extends Component
         $setting->ldap_company = $this->ldap_company;
         $setting->ldap_website = $this->ldap_website;
         $setting->ldap_active_flag = $this->ldap_active_flag;
-        $setting->ldap_invert_active_flag = $this->ldap_invert_active_flag ? '1' : '0';
+        $setting->ldap_invert_active_flag = $this->ldap_invert_active_flag;
 
         $this->persistAndAdvance($setting);
     }
@@ -944,6 +996,10 @@ class LdapSettings extends Component
         return [
             'ldap_username_field' => 'required|not_in:sAMAccountName',
             'ldap_fname_field' => 'required',
+            'company_source' => 'required|in:'.implode(',', LdapConnection::COMPANY_SOURCES),
+            'company_id' => 'nullable|integer|required_if:company_source,'.LdapConnection::COMPANY_SOURCE_CONNECTION.'|exists:companies,id',
+            'ldap_company' => 'nullable|required_if:company_source,'.LdapConnection::COMPANY_SOURCE_ATTRIBUTE,
+            'ldap_emp_num' => \Illuminate\Validation\Rule::requiredIf($this->link_by_employee_number),
         ];
     }
 
@@ -952,6 +1008,10 @@ class LdapSettings extends Component
         return [
             'ldap_username_field' => trans('admin/settings/general.ldap_username_field'),
             'ldap_fname_field' => trans('admin/settings/general.ldap_fname_field'),
+            'company_source' => trans('admin/settings/general.ldap_connections.company_source'),
+            'company_id' => trans('general.company'),
+            'ldap_company' => trans('admin/settings/general.ldap_company'),
+            'ldap_emp_num' => trans('admin/settings/general.ldap_emp_num'),
         ];
     }
 
@@ -1104,11 +1164,21 @@ class LdapSettings extends Component
         // bind, and mapping, so enabling LDAP is the whole point of the
         // final save. ldap_enabled is not user-toggleable in the wizard.
         // It's forced to 1 here.
-        $setting = Setting::getSettings();
-        $setting->ldap_enabled = '1';
-        $setting->ldap_pw_sync = $this->ldap_pw_sync ? '1' : '0';
+        // Turning a connection on also turns on LDAP globally: the master
+        // switch is what LoginController and ldap-sync check first.
+        $globalSettings = Setting::getSettings();
+        $globalSettings->ldap_enabled = '1';
+        $globalSettings->custom_forgot_pass_url = $this->custom_forgot_pass_url;
+        if (! $globalSettings->save()) {
+            $this->addError('save', trans('admin/settings/message.update.error'));
+
+            return null;
+        }
+
+        $setting = $this->connection();
+        $setting->enabled = true;
+        $setting->ldap_pw_sync = $this->ldap_pw_sync;
         $setting->ldap_default_group = $this->ldap_default_group;
-        $setting->custom_forgot_pass_url = $this->custom_forgot_pass_url;
 
         return $this->persistAndAdvance($setting);
     }
@@ -1142,6 +1212,17 @@ class LdapSettings extends Component
      * (steps 1-4 don't need it). Ordered alphabetically for pick-list
      * ergonomics.
      */
+    /**
+     * Companies for the step-3 "fixed company" select. The wizard is
+     * superadmin-only, so FMCS scoping is bypassed and every company is
+     * listed.
+     */
+    #[Computed]
+    public function companies(): array
+    {
+        return \App\Models\Company::withoutGlobalScopes()->whereNull('deleted_at')->orderBy('name')->pluck('name', 'id')->toArray();
+    }
+
     #[Computed]
     public function permissionGroups(): array
     {
@@ -1158,7 +1239,7 @@ class LdapSettings extends Component
      *   - AD: samaccountname, streetaddress, department, co (full
      *     country name), useraccountcontrol
      *   - inetOrgPerson / posixAccount: uid, street, departmentNumber,
-     *     c (ISO country code), o, labeledURI, no standard active-flag
+     *     c (ISO country code), labeledURI, no standard active-flag
      *     attribute
      * The rest (givenname, sn, mail, telephonenumber, mobile, title,
      * manager, l, st, postalcode) are shared across both.
@@ -1175,7 +1256,6 @@ class LdapSettings extends Component
         $address = $this->is_ad ? 'streetaddress' : 'street';
         $country = $this->is_ad ? 'co' : 'c';
         $activeFlag = $this->is_ad ? 'useraccountcontrol' : '';
-        $company = $this->is_ad ? 'company' : 'o';
         $website = $this->is_ad ? 'wwwhomepage' : 'labeleduri';
 
         return [
@@ -1196,7 +1276,6 @@ class LdapSettings extends Component
             ['ldap_zip', 'ldap_zip', 'postalcode', false, null],
             ['ldap_country', 'ldap_country', $country, false, null],
             ['ldap_location', 'ldap_location', 'physicaldeliveryofficename', false, 'ldap_location_help'],
-            ['ldap_company', 'ldap_company', $company, false, 'ldap_company_help'],
             ['ldap_website', 'ldap_website', $website, false, null],
             ['ldap_active_flag', 'ldap_active_flag', $activeFlag, false, 'ldap_activated_flag_help'],
         ];
@@ -1214,7 +1293,7 @@ class LdapSettings extends Component
     {
         session()->forget($this->progressSessionKey());
 
-        return $this->redirect(route('settings.index'));
+        return $this->redirect(route('settings.ldap.index'));
     }
 
     /**
@@ -1230,8 +1309,13 @@ class LdapSettings extends Component
             return null;
         }
 
-        $setting = Setting::getSettings();
-        $setting->ldap_enabled = '0';
+        // Disables this connection only; the global switch and any other
+        // connections are left alone.
+        $setting = $this->connection();
+        if (! $setting->exists) {
+            return null;
+        }
+        $setting->enabled = false;
         if (! $setting->save()) {
             $this->addError('save', trans('admin/settings/message.update.error'));
 
@@ -1241,7 +1325,7 @@ class LdapSettings extends Component
         session()->forget($this->progressSessionKey());
         session()->flash('success', trans('admin/settings/general.ldap_wizard.disabled_success'));
 
-        return $this->redirect(route('settings.index'));
+        return $this->redirect(route('settings.ldap.index'));
     }
 
     // === Shared helpers ======================================================
@@ -1279,7 +1363,7 @@ class LdapSettings extends Component
      */
     protected function openLdapConnectionForTest(string $actionType): ?\LDAP\Connection
     {
-        $settings = Setting::getSettings();
+        $settings = $this->connection();
         $server = (string) $settings->ldap_server;
         if ($settings->ldap_server_cert_ignore) {
             putenv('LDAPTLS_REQCERT=never');
@@ -1294,8 +1378,8 @@ class LdapSettings extends Component
         // test passing, the wizard becomes impossible to complete against
         // those servers. See #19519.
         if ($settings->ldap_client_tls_cert && $settings->ldap_client_tls_key) {
-            ldap_set_option(null, LDAP_OPT_X_TLS_CERTFILE, Setting::get_client_side_cert_path());
-            ldap_set_option(null, LDAP_OPT_X_TLS_KEYFILE, Setting::get_client_side_key_path());
+            ldap_set_option(null, LDAP_OPT_X_TLS_CERTFILE, $settings->clientCertPath());
+            ldap_set_option(null, LDAP_OPT_X_TLS_KEYFILE, $settings->clientKeyPath());
         }
 
         $conn = @ldap_connect($server);
@@ -1308,6 +1392,10 @@ class LdapSettings extends Component
 
             return null;
         }
+
+        // Same per-handle TLS context as runtime, so a test against one
+        // directory isn't run with another directory's cert settings.
+        Ldap::applyConnectionTlsOptions($conn, $settings);
 
         ldap_set_option($conn, LDAP_OPT_REFERRALS, 0);
         ldap_set_option($conn, LDAP_OPT_PROTOCOL_VERSION, 3);
@@ -1343,7 +1431,7 @@ class LdapSettings extends Component
      */
     protected function bindWithPersistedCredentials(\LDAP\Connection $conn, string $actionType): bool
     {
-        $settings = Setting::getSettings();
+        $settings = $this->connection();
 
         if (Ldap::shouldUseSaslExternal($settings)) {
             if (!@ldap_sasl_bind($conn, null, null, 'EXTERNAL')) {
@@ -1396,12 +1484,24 @@ class LdapSettings extends Component
      * saveStep1 and saveStep2 share the tail. New step handlers just
      * populate their own fields on $setting and call through.
      */
-    protected function persistAndAdvance(Setting $setting)
+    protected function persistAndAdvance(LdapConnection $setting)
     {
+        $wasNew = ! $setting->exists;
         if (! $setting->save()) {
+            foreach ($setting->getErrors()->getMessages() as $field => $messages) {
+                $this->addError($field, $messages[0]);
+            }
             $this->addError('save', trans('admin/settings/message.update.error'));
 
             return null;
+        }
+
+        // First save of a new connection: from here on the wizard edits
+        // that row, and the URL carries its id.
+        if ($wasNew) {
+            $previousKey = $this->progressSessionKey();
+            $this->connectionId = $setting->id;
+            session()->forget($previousKey);
         }
 
         $this->dirty = false;
@@ -1591,7 +1691,7 @@ class LdapSettings extends Component
         // no-terminating-newline forms. ad_domain gets trimmed too but
         // does NOT invalidate the test below; it's not part of the
         // ldap_bind() handshake, only post-connection scoping.
-        if (in_array($property, [...$connectionStringProps, 'ad_domain'], true)) {
+        if (in_array($property, [...$connectionStringProps, 'ad_domain', 'name'], true)) {
             $this->{$property} = trim($this->{$property});
         }
 
@@ -1636,6 +1736,13 @@ class LdapSettings extends Component
             'ldap_fname_field',
             'custom_forgot_pass_url',
             'test_sample_username',
+            'name',
+            'priority',
+            'company_source',
+            'company_id',
+            'ldap_company',
+            'ldap_emp_num',
+            'link_by_employee_number',
         ], true)) {
             $this->resetValidation($property);
         }

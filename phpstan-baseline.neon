@@ -367,12 +367,6 @@ parameters:
 			path: app/Console/Commands/LdapSync.php
 
 		-
-			message: '#^Access to an undefined property App\\Console\\Commands\\LdapTroubleshooter\:\:\$settings\.$#'
-			identifier: property.notFound
-			count: 3
-			path: app/Console/Commands/LdapTroubleshooter.php
-
-		-
 			message: '#^Binary operation "\-" between 32 and string results in an error\.$#'
 			identifier: binaryOp.invalid
 			count: 1

@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Models\Ldap;
+use App\Models\LdapConnection;
 use App\Models\Setting;
 use Exception;
 use Illuminate\Console\Command;
@@ -47,11 +48,18 @@ function parenthesized_filter($filter)
 class LdapTroubleshooter extends Command
 {
     /**
+     * The LDAP config being troubleshot: an LdapConnection, or the legacy
+     * settings row.
+     */
+    private object $settings;
+
+    /**
      * The name and signature of the console command.
      *
      * @var string
      */
     protected $signature = 'ldap:troubleshoot
+                            {--connection= : ID of the LDAP connection to troubleshoot (defaults to the first enabled one)}
                             {--ldap-search : Output an ldapsearch command-line for testing your LDAP config}
                             {--force : Skip the interactive yes/no prompt for confirmation}
                             {--debug : Include debugging output (verbose)}
@@ -143,7 +151,14 @@ class LdapTroubleshooter extends Command
             ldap_set_option(null, LDAP_OPT_DEBUG_LEVEL, 7);
         }
 
-        $settings = Setting::getSettings();
+        $settings = $this->option('connection') != ''
+            ? LdapConnection::find($this->option('connection'))
+            : Ldap::config();
+        if (! $settings) {
+            $this->error('LDAP connection '.$this->option('connection').' not found. ABORTING.');
+
+            return 1;
+        }
         $this->settings = $settings;
         if ($this->option('ldap-search')) {
             if (! $this->option('force')) {
@@ -169,8 +184,8 @@ class LdapTroubleshooter extends Command
                 // handshake error. escapeshellarg wraps in single quotes
                 // so install paths containing spaces still parse
                 // correctly when pasted.
-                $output[] = 'LDAPTLS_CERT='.escapeshellarg(Setting::get_client_side_cert_path());
-                $output[] = 'LDAPTLS_KEY='.escapeshellarg(Setting::get_client_side_key_path());
+                $output[] = 'LDAPTLS_CERT='.escapeshellarg($this->clientCertPath());
+                $output[] = 'LDAPTLS_KEY='.escapeshellarg($this->clientKeyPath());
             }
             $output[] = 'ldapsearch';
             $output[] = '-H '.escapeshellarg($settings->ldap_server);
@@ -245,7 +260,7 @@ class LdapTroubleshooter extends Command
         }
         // $this->line(print_r($settings,true));
         $this->line('STAGE 1: Checking settings');
-        if (! $settings->ldap_enabled) {
+        if (! Setting::getSettings()->ldap_enabled || ($settings instanceof LdapConnection && ! $settings->enabled)) {
             $this->error("WARNING: Snipe-IT's LDAP setting is not turned on. (That may be OK if you're still trying to figure out settings)");
         }
 
@@ -508,8 +523,8 @@ class LdapTroubleshooter extends Command
             // client-side TLS certificate support for LDAP (Google Secure LDAP).
             // Absolute paths so the test still works when the command runs
             // outside the app root (crontab, systemd unit, wrapper script).
-            putenv('LDAPTLS_CERT='.Setting::get_client_side_cert_path());
-            putenv('LDAPTLS_KEY='.Setting::get_client_side_key_path());
+            putenv('LDAPTLS_CERT='.$this->clientCertPath());
+            putenv('LDAPTLS_KEY='.$this->clientKeyPath());
         }
         if ($start_tls) {
             if (! ldap_start_tls($lconn)) {
@@ -688,6 +703,20 @@ class LdapTroubleshooter extends Command
      * for which to get back a SIGUSR1 or SIGUSR2 signal from the forked process.
      *
      ***********************************************/
+    /**
+     * Client cert / key file for the LDAP config being troubleshot: the
+     * connection's own file, or the legacy settings-row file.
+     */
+    private function clientCertPath(): string
+    {
+        return $this->settings instanceof LdapConnection ? $this->settings->clientCertPath() : Setting::get_client_side_cert_path();
+    }
+
+    private function clientKeyPath(): string
+    {
+        return $this->settings instanceof LdapConnection ? $this->settings->clientKeyPath() : Setting::get_client_side_key_path();
+    }
+
     private function timed_boolean_execute($function)
     {
         if (! (function_exists('pcntl_sigtimedwait') && function_exists('posix_getpid') && function_exists('pcntl_fork') && function_exists('posix_kill') && function_exists('pcntl_wifsignaled'))) {

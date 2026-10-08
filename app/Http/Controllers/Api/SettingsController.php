@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Transformers\DatatablesTransformer;
 use App\Http\Transformers\LoginAttemptsTransformer;
 use App\Models\Ldap;
+use App\Models\LdapConnection;
 use App\Models\Setting;
 use App\Notifications\MailTest;
 use Illuminate\Http\JsonResponse;
@@ -20,7 +21,26 @@ use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class SettingsController extends Controller
 {
-    public function ldaptest(): JsonResponse
+    /**
+     * Run $callback against the LDAP connection named by the optional
+     * connection_id request param, or the default LDAP config when absent.
+     * A missing or disabled connection gets a 400.
+     */
+    private function forRequestedLdapConnection(Request $request, callable $callback): JsonResponse
+    {
+        if (! $request->filled('connection_id')) {
+            return $callback();
+        }
+
+        $connection = LdapConnection::where('enabled', 1)->find($request->input('connection_id'));
+        if (! $connection) {
+            return response()->json(['message' => trans('admin/settings/general.ldap_connections.connection_unavailable', ['id' => $request->input('connection_id')])], 400);
+        }
+
+        return Ldap::withConnection($connection, $callback);
+    }
+
+    public function ldaptest(Request $request): JsonResponse
     {
         $settings = Setting::getSettings();
 
@@ -29,7 +49,8 @@ class SettingsController extends Controller
 
             return response()->json(['message' => 'LDAP is not enabled, cannot test.'], 400);
         }
-        return Helper::EqualTiming(5, function () {
+
+        return $this->forRequestedLdapConnection($request, fn () => Helper::EqualTiming(5, function () {
 
             Log::debug('Preparing to test LDAP connection');
 
@@ -82,7 +103,7 @@ class SettingsController extends Controller
 
                 return response()->json(['message' => $e->getMessage()], 400);
             }
-        });
+        }));
     }
 
     public function ldaptestlogin(Request $request): JsonResponse
@@ -108,6 +129,12 @@ class SettingsController extends Controller
         }
 
         Log::debug('Preparing to test LDAP login');
+
+        return $this->forRequestedLdapConnection($request, fn () => $this->testLdapLogin($request));
+    }
+
+    private function testLdapLogin(Request $request): JsonResponse
+    {
         try {
             $connection = Ldap::connectToLdap();
             try {

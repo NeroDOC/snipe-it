@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Auth;
 use App\Helpers\Helper;
 use App\Http\Controllers\Controller;
 use App\Models\Ldap;
+use App\Models\LdapConnection;
 use App\Models\SamlNonce;
 use App\Models\Setting;
 use App\Models\User;
@@ -165,6 +166,13 @@ class LoginController extends Controller
     /**
      * Log in a user by LDAP
      *
+     * With LDAP connections configured, a user already imported from LDAP
+     * is only ever checked against the connection that owns them (and not
+     * at all when that connection is disabled, so they fall through to
+     * local auth). Anyone else is tried against every enabled connection
+     * in priority order; the first successful bind wins and owns the user.
+     * Installs without connections keep using the legacy settings row.
+     *
      * @author Wes Hulette <jwhulette@gmail.com>
      *
      * @since 5.0.0
@@ -172,6 +180,45 @@ class LoginController extends Controller
      * @throws \Exception
      */
     private function loginViaLdap(Request $request): User
+    {
+        $username = (string) $request->input('username');
+
+        $ldapUser = User::where('username', '=', $username)->whereNull('deleted_at')->where('ldap_import', '=', 1)->first(); // FIXME - if we get more than one we should fail.
+        $ldapUser = User::verifyExactUsernameMatch($ldapUser, $username);
+        $activeLdapUser = ($ldapUser && $ldapUser->activated == '1') ? $ldapUser : null;
+        Log::debug('Local auth lookup complete');
+
+        if (! LdapConnection::query()->exists()) {
+            return $this->loginViaLdapConnection($request, $activeLdapUser);
+        }
+
+        if ($ldapUser && $ldapUser->ldap_connection_id) {
+            $owner = LdapConnection::where('enabled', 1)->find($ldapUser->ldap_connection_id);
+            $connections = $owner ? collect([$owner]) : collect();
+        } else {
+            $connections = LdapConnection::enabled()->get();
+        }
+
+        $lastException = null;
+        foreach ($connections as $connection) {
+            try {
+                return Ldap::withConnection($connection, fn () => $this->loginViaLdapConnection($request, $activeLdapUser));
+            } catch (\Exception $e) {
+                Log::debug('LDAP login via connection '.$connection->name.' failed: '.$e->getMessage());
+                $lastException = $e;
+            }
+        }
+
+        throw $lastException ?? new \Exception('No enabled LDAP connection for this user');
+    }
+
+    /**
+     * Bind the user against the active LDAP config (Ldap::config()) and
+     * create or refresh their local account from the directory entry.
+     *
+     * @throws \Exception
+     */
+    private function loginViaLdapConnection(Request $request, ?User $user): User
     {
         Log::debug('Binding user to LDAP.');
         $ldap_user = Ldap::findAndBindUserLdap($request->input('username'), $request->input('password'));
@@ -182,15 +229,22 @@ class LoginController extends Controller
             Log::debug('LDAP user '.$request->input('username').' successfully bound to LDAP');
         }
 
-        // Check if the user already exists in the database and was imported via LDAP
-        $user = User::where('username', '=', $request->input('username'))->whereNull('deleted_at')->where('ldap_import', '=', 1)->where('activated', '=', '1')->first(); // FIXME - if we get more than one we should fail. and we sure about this ldap_import thing?
-        $user = User::verifyExactUsernameMatch($user, (string) $request->input('username'));
-        Log::debug('Local auth lookup complete');
-
         // The user does not exist in the database. Try to get them from LDAP.
         // If user does not exist and authenticates successfully with LDAP we
         // will create it on the fly and sign in with default permissions
         if (! $user) {
+            // Same person, owned by another connection and matched by
+            // employee number: sign in to that account rather than
+            // creating a second one.
+            $ldap_attr = Ldap::parseAndMapLdapAttributes($ldap_user);
+            $linked = Ldap::findLinkableUser($ldap_attr);
+            if ($linked && $linked->activated == '1') {
+                Log::debug('LDAP user '.$request->input('username').' linked to local user '.$linked->username.' by employee number');
+                Ldap::linkUserToCurrentConnection($linked, $ldap_attr);
+
+                return $linked;
+            }
+
             Log::debug('Local user '.$request->input('username').' does not exist');
             Log::debug('Creating local user '.$request->input('username'));
 
@@ -205,7 +259,7 @@ class LoginController extends Controller
             Log::debug('Local user '.$request->input('username').' exists in database. Updating existing user against LDAP.');
 
             $ldap_attr = Ldap::parseAndMapLdapAttributes($ldap_user);
-            $settings = Setting::getSettings();
+            $settings = Ldap::config();
 
             $user->password = $user->noPassword();
             if ($settings->ldap_pw_sync == '1') {
@@ -213,6 +267,7 @@ class LoginController extends Controller
             }
 
             $user->last_login = \Carbon::now();
+            $user->ldap_connection_id = Ldap::currentConnection()->id ?? $user->ldap_connection_id;
 
             // Refresh every mapped field from the LDAP payload. Shared
             // with Ldap::createUserFromLdap so the field list lives in

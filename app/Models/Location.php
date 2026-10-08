@@ -44,6 +44,7 @@ class Location extends SnipeModel
         'country' => 'min:2|max:191|nullable',
         'zip' => 'max:10|nullable',
         'manager_id' => 'exists:users,id|nullable',
+        'ldap_connection_id' => 'nullable|integer|exists:ldap_connections,id',
         'parent_id' => 'nullable|exists:locations,id|non_circular:locations,id|parent_matches_location_company',
         'company_id' => 'integer|nullable|exists:companies,id|fmcs_company',
     ];
@@ -51,6 +52,7 @@ class Location extends SnipeModel
     protected $casts = [
         'parent_id' => 'integer',
         'manager_id' => 'integer',
+        'ldap_connection_id' => 'integer',
         'company_id' => 'integer',
     ];
 

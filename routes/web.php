@@ -398,16 +398,11 @@ Route::group(['prefix' => 'admin', 'middleware' => ['auth', 'authorize:superuser
         ->breadcrumbs(fn (Trail $trail) => $trail->parent('settings.index')
             ->push(trans('admin/settings/general.ldap_ad'), route('settings.ldap.index')));
 
-    Route::post('ldap', [SettingsController::class, 'postLdapSettings'])
-        ->name('settings.ldap.save');
-
-    // Livewire wizard version of the LDAP settings screen. Lives at its
-    // own URL for now; the legacy form stays in place until the wizard
-    // has been tested end-to-end.
+    // Create / edit one LDAP connection (?connection=<id>; none = new).
     Route::view('ldap-wizard', 'settings.ldap-wizard')
         ->name('settings.ldap.wizard')
-        ->breadcrumbs(fn (Trail $trail) => $trail->parent('settings.index')
-            ->push(trans('admin/settings/general.ldap_ad'), route('settings.ldap.wizard')));
+        ->breadcrumbs(fn (Trail $trail) => $trail->parent('settings.ldap.index')
+            ->push(trans('admin/settings/general.ldap_connections.wizard_breadcrumb'), route('settings.ldap.wizard')));
 
     Route::get('phpinfo', [SettingsController::class, 'getPhpInfo'])
         ->name('settings.phpinfo.index')

@@ -4,6 +4,7 @@ namespace Tests\Feature\Settings;
 
 use App\Livewire\LdapSettings;
 use App\Models\Group;
+use App\Models\LdapConnection;
 use App\Models\Setting;
 use App\Models\User;
 use Illuminate\Support\Facades\Crypt;
@@ -34,6 +35,12 @@ use Tests\TestCase;
  */
 class LdapWizardTest extends TestCase
 {
+    /**
+     * The LDAP connection the wizard edits in each test, created by
+     * ensureSetting().
+     */
+    private ?LdapConnection $connection = null;
+
     private function actAsSuperuser(): User
     {
         $user = User::factory()->superuser()->create();
@@ -42,30 +49,41 @@ class LdapWizardTest extends TestCase
         return $user;
     }
 
-    private function ensureSetting(array $overrides = []): Setting
+    /**
+     * Reset global settings and create the LDAP connection the wizard
+     * edits. $overrides use the wizard's property names; ldap_enabled maps
+     * to the connection's own enabled flag.
+     */
+    private function ensureSetting(array $overrides = []): LdapConnection
     {
         // Reset the Setting singleton cache. Setting::getSettings()
         // memoizes into a public static \$_cache, and any prior test
         // (or the framework boot) that touched Setting::first() before
         // this test's factory ran will otherwise hand back a stale row.
         Setting::$_cache = null;
+        Setting::$_cache = Setting::first() ?? Setting::factory()->create();
 
-        $setting = Setting::first() ?? Setting::factory()->create();
-
-        // Setting's \$fillable is restrictive (site_name, email_domain,
-        // and a handful of others). LDAP fields are NOT fillable, so
-        // fill() / factory create() would silently drop them. forceFill
-        // + save writes them directly.
-        if ($overrides) {
-            $setting->forceFill($overrides)->save();
-            $setting = $setting->fresh();
+        if (array_key_exists('ldap_enabled', $overrides)) {
+            $overrides['enabled'] = (bool) $overrides['ldap_enabled'];
+            unset($overrides['ldap_enabled']);
         }
 
-        // Prime the singleton cache with the row we just wrote so any
-        // in-test call to Setting::getSettings() picks up our values.
-        Setting::$_cache = $setting;
+        // forceFill + forceSave: the LDAP columns aren't mass-assignable
+        // and a half-configured connection wouldn't pass model validation.
+        $connection = new LdapConnection;
+        $connection->forceFill(['name' => 'Test directory'] + $overrides);
+        $connection->forceSave();
 
-        return $setting;
+        return $this->connection = $connection->fresh();
+    }
+
+    /**
+     * Livewire test harness for the wizard on $this->connection.
+     */
+    private function wizard(array $queryParams = [])
+    {
+        return Livewire::withQueryParams(['connection' => $this->connection->id] + $queryParams)
+            ->test(LdapSettings::class);
     }
 
     // === Authorization =====================================================
@@ -79,7 +97,7 @@ class LdapWizardTest extends TestCase
         // as a 403 status on the testable rather than rethrowing the
         // HttpException. Match the wire test harness's shape, not the
         // raw exception class.
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertStatus(403);
     }
 
@@ -88,7 +106,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertStatus(200);
     }
 
@@ -108,7 +126,7 @@ class LdapWizardTest extends TestCase
             'ldap_fname_field' => 'givenname',
         ]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertSet('ldap_enabled', true)
             ->assertSet('ldap_server', 'ldaps://ldap.example.com')
             ->assertSet('is_ad', true)
@@ -129,7 +147,7 @@ class LdapWizardTest extends TestCase
 
         // Even with an encrypted password on disk, the Livewire prop
         // must be empty so the plaintext never crosses the wire.
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertSet('ldap_pword', '');
     }
 
@@ -140,7 +158,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertSet('currentStep', 1)
             ->call('goToStep', 3)
             ->assertSet('currentStep', 1);
@@ -151,7 +169,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 3)
             ->set('currentStep', 3)
             ->call('goToStep', 2)
@@ -168,7 +186,7 @@ class LdapWizardTest extends TestCase
             'ldap_email' => 'mail',
         ]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 3)
             ->set('currentStep', 3)
             // Simulate the user clearing fields (this flips dirty=true
@@ -196,8 +214,7 @@ class LdapWizardTest extends TestCase
         $this->ensureSetting();
 
         // Simulate ?step=4 with no session progress. Should clamp to 1.
-        Livewire::withQueryParams(['step' => 4])
-            ->test(LdapSettings::class)
+        $this->wizard(['step' => 4])
             ->assertSet('currentStep', 1);
     }
 
@@ -208,7 +225,7 @@ class LdapWizardTest extends TestCase
 
         // No URL step param. LDAP is on. Should land on the completion
         // screen (step 5) with the full wizard unlocked.
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertSet('currentStep', 5)
             ->assertSet('highestStepReached', 5);
     }
@@ -221,8 +238,7 @@ class LdapWizardTest extends TestCase
         // Explicit ?step=2 with ldap_enabled=1 should NOT get bumped up
         // to step 5. Return visitors need to be able to jump back to
         // earlier steps to edit config.
-        Livewire::withQueryParams(['step' => 2])
-            ->test(LdapSettings::class)
+        $this->wizard(['step' => 2])
             ->assertSet('currentStep', 2)
             ->assertSet('highestStepReached', 5);
     }
@@ -232,7 +248,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting(['ldap_enabled' => 0]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertSet('currentStep', 1)
             ->assertSet('highestStepReached', 1);
     }
@@ -244,7 +260,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', '')
             ->call('saveAndAdvance')
             ->assertHasErrors(['ldap_server' => 'required']);
@@ -255,7 +271,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'https://example.com')
             ->call('saveAndAdvance')
             ->assertHasErrors(['ldap_server' => 'starts_with']);
@@ -266,7 +282,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://ldap.example.com')
             ->set('is_ad', true)
             ->set('ad_domain', '')
@@ -285,7 +301,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('is_ad', true)
             ->set('ad_domain', 'example.com')
             ->assertSet('ad_domain', 'example.com')
@@ -298,7 +314,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://ldap.example.com')
             ->set('ldap_client_tls_key', "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----")
             ->set('ldap_client_tls_cert', '')
@@ -312,7 +328,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://ldap.example.com')
             ->set('ldap_client_tls_key', 'not a real pem')
             ->set('ldap_client_tls_cert', 'also not a real pem')
@@ -328,7 +344,7 @@ class LdapWizardTest extends TestCase
         $this->ensureSetting();
         config(['app.test_allow_private_ips' => false]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://localhost')
             ->call('saveAndAdvance')
             ->assertHasErrors(['ldap_server']);
@@ -340,7 +356,7 @@ class LdapWizardTest extends TestCase
         $this->ensureSetting();
         config(['app.test_allow_private_ips' => false]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://192.168.1.10')
             ->call('saveAndAdvance')
             ->assertHasErrors(['ldap_server']);
@@ -352,7 +368,7 @@ class LdapWizardTest extends TestCase
         $this->ensureSetting();
         config(['app.test_allow_private_ips' => false]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://169.254.169.254')
             ->call('saveAndAdvance')
             ->assertHasErrors(['ldap_server']);
@@ -376,7 +392,7 @@ class LdapWizardTest extends TestCase
         // public host so the code reaches the rate-limit check (it
         // runs after IP policy for private-IP-safe servers, but
         // rate limit is checked BEFORE the LDAP connect).
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://ldap.forumsys.com')
             ->call('saveAndAdvance')
             ->assertSet('testStatus', 'error');
@@ -389,7 +405,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 2)
             ->set('currentStep', 2)
             ->set('ldap_uname', '')
@@ -410,7 +426,7 @@ class LdapWizardTest extends TestCase
 
         // Uname matches persisted, pword left blank on the form. The
         // password rule should not fire.
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 2)
             ->set('currentStep', 2)
             ->set('ldap_uname', 'cn=admin,dc=example,dc=com')
@@ -429,7 +445,7 @@ class LdapWizardTest extends TestCase
             'ldap_pword' => Crypt::encrypt('persistedsecret'),
         ]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 2)
             ->set('currentStep', 2)
             ->set('ldap_uname', 'cn=newadmin,dc=example,dc=com')
@@ -445,7 +461,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 2)
             ->set('currentStep', 2)
             ->set('ldap_uname', 'cn=read-only-admin,dc=example,dc=com')
@@ -464,7 +480,7 @@ class LdapWizardTest extends TestCase
         // Different case + varying whitespace around commas should still
         // trip the guard, since directories are case-insensitive on DN
         // comparisons and comma-adjacent whitespace is not significant.
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 2)
             ->set('currentStep', 2)
             ->set('ldap_uname', 'cn=admin,dc=example,dc=com')
@@ -485,7 +501,7 @@ class LdapWizardTest extends TestCase
 
         // The normal, correct relationship: bind DN lives under the base
         // DN. Should pass the base-DN-equals-bind-DN closure.
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 2)
             ->set('currentStep', 2)
             ->set('ldap_uname', 'cn=admin,dc=example,dc=com')
@@ -504,7 +520,7 @@ class LdapWizardTest extends TestCase
             'ldap_pword' => Crypt::encrypt('persistedsecret'),
         ]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 2)
             ->set('currentStep', 2)
             ->set('ldap_uname', 'cn=admin,dc=example,dc=com')
@@ -523,7 +539,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 3)
             ->set('currentStep', 3)
             ->set('ldap_username_field', '')
@@ -537,7 +553,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 3)
             ->set('currentStep', 3)
             ->set('ldap_username_field', 'sAMAccountName')
@@ -551,7 +567,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 3)
             ->set('currentStep', 3)
             ->set('ldap_username_field', 'samaccountname')
@@ -562,9 +578,88 @@ class LdapWizardTest extends TestCase
             ->assertHasNoErrors()
             ->assertSet('currentStep', 4);
 
-        $setting = Setting::getSettings()->fresh();
+        $setting = $this->connection->fresh();
         $this->assertSame('company', $setting->ldap_company);
         $this->assertSame('wwwhomepage', $setting->ldap_website);
+    }
+
+    public function test_new_connection_requires_a_name(): void
+    {
+        $this->actAsSuperuser();
+        Setting::$_cache = null;
+
+        Livewire::test(LdapSettings::class)
+            ->set('name', '')
+            ->set('ldap_server', 'ldaps://ldap.example.com')
+            ->call('saveAndAdvance')
+            ->assertHasErrors(['name']);
+
+        $this->assertSame(0, LdapConnection::count());
+    }
+
+    public function test_step3_fixed_company_source_requires_a_company(): void
+    {
+        $this->actAsSuperuser();
+        $this->ensureSetting();
+
+        $this->wizard()
+            ->set('highestStepReached', 3)
+            ->set('currentStep', 3)
+            ->set('ldap_username_field', 'samaccountname')
+            ->set('ldap_fname_field', 'givenname')
+            ->set('company_source', LdapConnection::COMPANY_SOURCE_CONNECTION)
+            ->set('company_id', null)
+            ->call('saveAndAdvance')
+            ->assertHasErrors(['company_id']);
+    }
+
+    public function test_step3_linking_by_employee_number_requires_the_employee_number_mapping(): void
+    {
+        $this->actAsSuperuser();
+        $this->ensureSetting();
+
+        $this->wizard()
+            ->set('highestStepReached', 3)
+            ->set('currentStep', 3)
+            ->set('ldap_username_field', 'samaccountname')
+            ->set('ldap_fname_field', 'givenname')
+            ->set('link_by_employee_number', true)
+            ->set('ldap_emp_num', '')
+            ->call('saveAndAdvance')
+            ->assertHasErrors(['ldap_emp_num']);
+
+        $this->wizard()
+            ->set('highestStepReached', 3)
+            ->set('currentStep', 3)
+            ->set('ldap_username_field', 'samaccountname')
+            ->set('ldap_fname_field', 'givenname')
+            ->set('link_by_employee_number', true)
+            ->set('ldap_emp_num', 'employeeid')
+            ->call('saveAndAdvance')
+            ->assertHasNoErrors();
+
+        $this->assertTrue($this->connection->fresh()->link_by_employee_number);
+    }
+
+    public function test_step3_persists_fixed_company_source(): void
+    {
+        $this->actAsSuperuser();
+        $this->ensureSetting();
+        $company = \App\Models\Company::factory()->create();
+
+        $this->wizard()
+            ->set('highestStepReached', 3)
+            ->set('currentStep', 3)
+            ->set('ldap_username_field', 'samaccountname')
+            ->set('ldap_fname_field', 'givenname')
+            ->set('company_source', LdapConnection::COMPANY_SOURCE_CONNECTION)
+            ->set('company_id', $company->id)
+            ->call('saveAndAdvance')
+            ->assertHasNoErrors();
+
+        $fresh = $this->connection->fresh();
+        $this->assertSame(LdapConnection::COMPANY_SOURCE_CONNECTION, $fresh->company_source);
+        $this->assertSame($company->id, $fresh->company_id);
     }
 
     // === Step 4 business logic =============================================
@@ -574,7 +669,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting(['ldap_enabled' => 0]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 4)
             ->set('currentStep', 4)
             ->set('ldap_default_group', null)
@@ -582,6 +677,7 @@ class LdapWizardTest extends TestCase
             ->call('saveAndAdvance');
 
         $this->assertSame('1', Setting::getSettings()->ldap_enabled);
+        $this->assertTrue($this->connection->fresh()->enabled);
     }
 
     public function test_step4_advances_to_completion_step_after_save(): void
@@ -589,7 +685,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 4)
             ->set('currentStep', 4)
             ->set('ldap_default_group', null)
@@ -603,7 +699,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 4)
             ->set('currentStep', 4)
             ->set('ldap_default_group', 999_999)
@@ -617,14 +713,14 @@ class LdapWizardTest extends TestCase
         $this->ensureSetting();
         $group = Group::factory()->create();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 4)
             ->set('currentStep', 4)
             ->set('ldap_default_group', $group->id)
             ->call('saveAndAdvance')
             ->assertHasNoErrors(['ldap_default_group']);
 
-        $this->assertSame($group->id, (int) Setting::getSettings()->ldap_default_group);
+        $this->assertSame($group->id, (int) $this->connection->fresh()->ldap_default_group);
     }
 
     public function test_step4_custom_forgot_pass_url_must_be_valid_url(): void
@@ -632,7 +728,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('highestStepReached', 4)
             ->set('currentStep', 4)
             ->set('custom_forgot_pass_url', 'not a url')
@@ -651,12 +747,12 @@ class LdapWizardTest extends TestCase
             'ldap_uname' => 'cn=admin,dc=example,dc=com',
         ]);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->call('disableLdap')
-            ->assertRedirect(route('settings.index'));
+            ->assertRedirect(route('settings.ldap.index'));
 
-        $fresh = Setting::getSettings();
-        $this->assertSame('0', (string) $fresh->ldap_enabled);
+        $fresh = $this->connection->fresh();
+        $this->assertFalse($fresh->enabled);
         // Other settings preserved so the wizard can re-enable later
         // without the user re-entering everything.
         $this->assertSame('ldaps://ldap.example.com', $fresh->ldap_server);
@@ -668,10 +764,10 @@ class LdapWizardTest extends TestCase
         $user = $this->actAsSuperuser();
         $this->ensureSetting(['ldap_enabled' => 1]);
 
-        $key = 'ldap_wizard_highest_step:'.$user->id;
+        $key = 'ldap_wizard_highest_step:'.$user->id.':'.$this->connection->id;
         session()->put($key, 4);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->call('disableLdap');
 
         $this->assertFalse(session()->has($key));
@@ -684,12 +780,12 @@ class LdapWizardTest extends TestCase
         $user = $this->actAsSuperuser();
         $this->ensureSetting();
 
-        $key = 'ldap_wizard_highest_step:'.$user->id;
+        $key = 'ldap_wizard_highest_step:'.$user->id.':'.$this->connection->id;
         session()->put($key, 5);
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->call('finishWizard')
-            ->assertRedirect(route('settings.index'));
+            ->assertRedirect(route('settings.ldap.index'));
 
         $this->assertFalse(session()->has($key));
     }
@@ -713,7 +809,7 @@ class LdapWizardTest extends TestCase
 
         // Trigger a step-1 test that will fail on the SSRF gate, which
         // still routes through recordFieldError -> writeTestAuditLog.
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', 'ldap://localhost')
             ->call('saveAndAdvance');
 
@@ -732,7 +828,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->set('ldap_server', '  ldap://ldap.example.com  ')
             ->assertSet('ldap_server', 'ldap://ldap.example.com')
             ->set('ldap_uname', "\tcn=admin,dc=example,dc=com\n")
@@ -744,7 +840,7 @@ class LdapWizardTest extends TestCase
         $this->actAsSuperuser();
         $this->ensureSetting();
 
-        Livewire::test(LdapSettings::class)
+        $this->wizard()
             ->assertSet('dirty', false)
             ->set('ldap_server', 'ldap://ldap.example.com')
             ->assertSet('dirty', true);

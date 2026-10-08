@@ -2,6 +2,7 @@
 
 namespace Database\Seeders;
 
+use App\Models\LdapConnection;
 use App\Models\Setting;
 use App\Models\User;
 use Illuminate\Database\Seeder;
@@ -65,6 +66,24 @@ class SettingsSeeder extends Seeder
         $settings->pwd_secure_min = '8';
         $settings->default_avatar = 'default.png';
         $settings->save();
+
+        // The same Forumsys directory as an LDAP connection, which is what
+        // login, sync and the wizard actually read.
+        LdapConnection::query()->delete();
+        $forumsys = new LdapConnection;
+        $forumsys->name = 'Forumsys';
+        $forumsys->enabled = true;
+        $forumsys->ldap_server = 'ldap://ldap.forumsys.com';
+        $forumsys->ldap_basedn = 'dc=example,dc=com';
+        $forumsys->ldap_uname = 'cn=read-only-admin,dc=example,dc=com';
+        $forumsys->ldap_pword = Crypt::encrypt('password');
+        $forumsys->ldap_filter = '';
+        $forumsys->ldap_auth_filter_query = 'uid=';
+        $forumsys->ldap_username_field = 'uid';
+        $forumsys->ldap_fname_field = 'cn';
+        $forumsys->ldap_lname_field = 'sn';
+        $forumsys->ldap_email = 'mail';
+        $forumsys->save();
 
         if ($user = User::where('username', '=', 'admin')->first()) {
             $user->locale = 'en-US';
